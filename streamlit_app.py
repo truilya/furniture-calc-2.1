@@ -792,7 +792,7 @@ def parse_quantity(value: Any, position: int) -> float:
             f"{type(value).__name__}."
         )
 
-    if not math.isfinite(number) or not 0 < number < 1_000_000_000:
+    if not math.isfinite(number) or not 0 <= number < 1_000_000_000:
         raise AppError(
             f"Позиция №{position}: количество должно быть положительным числом."
             f"value{number}"
