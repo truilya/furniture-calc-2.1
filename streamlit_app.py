@@ -150,8 +150,10 @@ SYSTEM_PROMPT = """
 1. Каждая нумерованная товарная позиция приложения «Перечень объектов
    закупки» — отдельный объект. Не объединяй одинаковые названия.
 2. Сохраняй номер позиции из документа. Не перенумеровывай товары.
-3. Количество и единицу измерения бери из строки объема товара, а не
-   из характеристик вроде количества мест или ножек.
+3. Количество бери из строки объема товара. Если в ТЗ написано
+   «50 (Штука)», верни "quantity": 50 и "unit": "Штука".
+   quantity всегда должно быть JSON-числом, не строкой и не null.
+   Не используй количество мест, ножек или дней.
 4. Сохраняй индивидуальные характеристики позиции отдельными строками,
    включая материалы, габариты, диапазоны, цвет, отрицания и конструкцию.
 5. Общие юридические разделы не включай в характеристики товара.
@@ -758,6 +760,44 @@ def validate_string_list(
 
     return tuple(result)
 
+def parse_quantity(value: Any, position: int) -> float:
+    """Принимает JSON-число или строку вида '50', '50,5', '50 (Штука)'."""
+    if isinstance(value, bool) or value is None:
+        raise AppError(
+            f"Позиция №{position}: quantity не указан или имеет неверный тип."
+        )
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        text = value.strip().replace("\u00a0", " ")
+
+        match = re.fullmatch(
+            r"(\d+(?:[ \u202f]\d{3})*(?:[.,]\d+)?)"
+            r"(?:\s*\([^)]+\))?",
+            text,
+        )
+        if not match:
+            raise AppError(
+                f"Позиция №{position}: не удалось распознать quantity: "
+                f"{text[:80]!r}"
+            )
+
+        number = float(
+            match.group(1).replace(" ", "").replace("\u202f", "").replace(",", ".")
+        )
+    else:
+        raise AppError(
+            f"Позиция №{position}: неверный тип quantity: "
+            f"{type(value).__name__}."
+        )
+
+    if not math.isfinite(number) or not 0 < number < 1_000_000_000:
+        raise AppError(
+            f"Позиция №{position}: количество должно быть положительным числом."
+        )
+
+    return number
 
 def validate_item(
     raw: Any,
@@ -809,32 +849,7 @@ def validate_item(
             "положительным."
         )
 
-    quantity = raw.get(
-        "quantity"
-    )
-
-    if (
-        isinstance(
-            quantity,
-            bool,
-        )
-        or not isinstance(
-            quantity,
-            (int, float),
-        )
-        or not math.isfinite(
-            float(quantity)
-        )
-        or not (
-            0
-            < float(quantity)
-            < 1_000_000_000
-        )
-    ):
-        raise AppError(
-            f"Позиция №{number}: "
-            "некорректное количество."
-        )
+    quantity = parse_quantity(raw.get("quantity"), number)
 
     logistics_raw = raw.get(
         "delivery_logistics"
