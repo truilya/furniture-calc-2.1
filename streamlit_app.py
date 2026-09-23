@@ -1266,14 +1266,7 @@ def extract_data_with_llm(
 
         for raw_item in raw_items:
 
-            st.write(
-                f"Диагностика позиции №{number}:",
-                {
-                    "quantity": raw.get("quantity"),
-                    "unit": raw.get("unit"),
-                },
-            )
-
+           
             item = validate_item(
                 raw_item
             )
