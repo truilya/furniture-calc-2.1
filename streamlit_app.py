@@ -1,5 +1,5 @@
 """
-Приложение: PDF-ТЗ → существующий шаблон Excel.
+PDF-ТЗ → подготовленный Excel-шаблон.
 
 Установка:
     pip install streamlit pypdf openpyxl pandas requests
@@ -7,22 +7,17 @@
 Запуск:
     streamlit run app.py
 
-Секреты задаются через переменные окружения или .streamlit/secrets.toml:
-    OPENAI_API_KEY = "..."
-    YANDEX_API_KEY = "..."
-    YANDEX_FOLDER_ID = "..."
-
-Для YandexGPT также поддерживается YANDEX_IAM_TOKEN вместо YANDEX_API_KEY.
-
-Принцип сохранности шаблона:
-- существующие строки и листы не вставляются, не удаляются и не перестраиваются;
-- формулы, заголовки и служебные листы не перезаписываются;
-- запись допускается только в проверенные ячейки товарных блоков;
-- если блоков или строк характеристик не хватает, приложение останавливается
-  и просит подготовить расширенный шаблон. Это безопаснее, чем сдвигать формулы.
-
-Шаблон-пример содержит старые цены, расчеты и логистические оценки. Приложение
-не выдает их за данные нового ТЗ и предупреждает пользователя об их проверке.
+Безопасность и ограничения:
+- API-ключ вводится пользователем в боковой панели и не записывается в XLSX.
+- Для публичных провайдеров используется HTTPS.
+- Собственный endpoint допускает HTTP для локального Ollama/vLLM.
+- PDF должен содержать извлекаемый текст: OCR сканов здесь не выполняется.
+- Приложение не вставляет и не удаляет строки шаблона, чтобы не сдвигать
+  формулы и связанные диапазоны.
+- Товарные блоки сопоставляются строго по номерам позиций.
+- Если PDF и шаблон относятся к разным закупкам, обработка останавливается.
+- Существующие цены, логистические оценки и текст служебных листов не
+  объявляются данными нового ТЗ и не заменяются догадками модели.
 """
 
 from __future__ import annotations
@@ -30,60 +25,90 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import os
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import openpyxl
 import pandas as pd
 import requests
 import streamlit as st
 from openpyxl.cell.cell import MergedCell
-from openpyxl.utils import get_column_letter
 from pypdf import PdfReader
 
 
-# ----------------------------- Настройки ----------------------------------
+# ---------------------------------------------------------------------------
+# Конфигурация
+# ---------------------------------------------------------------------------
 
-MAX_PDF_BYTES = 25 * 1024 * 1024
-MAX_XLSX_BYTES = 25 * 1024 * 1024
-MAX_PDF_PAGES = 100
-MAX_CHUNK_CHARS = 11_000
-REQUEST_TIMEOUT = (10, 120)
-MAX_LLM_RESPONSE_TOKENS = 8_000
+PROVIDERS: dict[str, dict[str, Any]] = {
+    "OpenAI": {
+        "base_url": "https://api.openai.com/v1",
+        "models": [
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+        ],
+    },
+    "OpenRouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "models": [
+            "anthropic/claude-sonnet-5",
+            "openai/gpt-5.6-sol",
+            "google/gemini-3.1-flash-lite",
+            "deepseek/deepseek-v4-pro",
+            "qwen/qwen-2.5-vl-72b-instruct",
+            "openai/gpt-4o-mini",
+            "anthropic/claude-3.5-haiku",
+            "meta-llama/llama-3.1-70b-instruct",
+        ],
+    },
+    "Groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "models": [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+        ],
+    },
+    "Свой endpoint": {
+        "base_url": "http://localhost:11434/v1",
+        "models": [
+            "deepseek-r1:70b",
+            "qwen2.5-vl:72b",
+        ],
+    },
+}
 
 PRICE_SHEET = "Цены изделий (входящие)"
 LOGISTICS_SHEET = "Логистика и пр. расходы"
 ECONOMICS_SHEET = "Экономика"
 
-MODEL_CONFIG = {
-    "YandexGPT Pro": {
-        "provider": "yandex",
-        "model": "yandexgpt/latest",
-    },
-    "YandexGPT Lite": {
-        "provider": "yandex",
-        "model": "yandexgpt-lite/latest",
-    },
-    "GPT-4o-mini": {
-        "provider": "openai",
-        "model": "gpt-4o-mini",
-    },
-}
+MAX_PDF_BYTES = 25 * 1024 * 1024
+MAX_XLSX_BYTES = 25 * 1024 * 1024
+MAX_PDF_PAGES = 100
 
-# Допускаем только числовой префикс позиции. Это позволяет сохранить различие
-# между двумя позициями с одинаковым названием «Диван».
+# Размер ограничивает один запрос. Длинные документы обрабатываются частями.
+MAX_CHUNK_CHARS = 10_000
+MAX_OUTPUT_TOKENS = 8_000
+
+REQUEST_TIMEOUT = (10, 180)
+
 ITEM_NUMBER_RE = re.compile(r"^\s*(\d{1,4})\s*[.)](?:\s|$)")
-NUMBERED_PDF_ITEM_RE = re.compile(
-    r"(?m)^\s*(\d{1,4})\.\s*"
-    r"(?!Общая\b|Стандарт\b|Объем\b|Требования\b|Перечень\b)"
-    r"([А-ЯЁ][^\n]{0,140})"
-)
 
 
 class AppError(Exception):
-    """Ошибка, которую можно безопасно показать пользователю."""
+    """Ошибка, сообщение которой можно показать в интерфейсе."""
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    provider: str
+    model: str
+    base_url: str
+    api_key: str
 
 
 @dataclass(frozen=True)
@@ -102,89 +127,11 @@ class RowBlock:
     position_number: int
     first_row: int
     last_row: int
-    existing_name: str
 
-
-# -------------------------- Секреты и файлы --------------------------------
-
-def get_secret(name: str) -> str:
-    """Получить секрет без вывода его значения в интерфейс или журнал."""
-    value = os.environ.get(name)
-    if value:
-        return value
-    try:
-        return str(st.secrets.get(name, "") or "")
-    except (FileNotFoundError, KeyError):
-        return ""
-
-
-def read_uploaded_file(uploaded_file: Any, limit: int, kind: str) -> bytes:
-    try:
-        data = uploaded_file.getvalue()
-    except Exception as exc:
-        raise AppError(f"Не удалось прочитать {kind}: {exc}") from exc
-
-    if not data:
-        raise AppError(f"{kind} пуст.")
-    if len(data) > limit:
-        raise AppError(
-            f"{kind} превышает допустимый размер "
-            f"{limit // (1024 * 1024)} МБ."
-        )
-    return data
-
-
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    if not pdf_bytes.startswith(b"%PDF"):
-        raise AppError("Загруженный PDF не имеет корректной сигнатуры.")
-
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
-        if reader.is_encrypted:
-            raise AppError("Зашифрованный PDF не поддерживается.")
-        if len(reader.pages) > MAX_PDF_PAGES:
-            raise AppError(f"PDF содержит более {MAX_PDF_PAGES} страниц.")
-
-        pages: list[str] = []
-        for index, page in enumerate(reader.pages, start=1):
-            text = page.extract_text(extraction_mode="layout") or ""
-            if text.strip():
-                pages.append(f"\n[СТРАНИЦА {index}]\n{text}")
-
-        result = "\n".join(pages).strip()
-    except AppError:
-        raise
-    except Exception as exc:
-        raise AppError(f"Ошибка извлечения текста PDF: {exc}") from exc
-
-    if len(result) < 100:
-        raise AppError(
-            "В PDF почти нет извлекаемого текста. Вероятно, это скан: "
-            "требуется OCR до загрузки файла."
-        )
-    return result
-
-
-def open_template(xlsx_bytes: bytes) -> openpyxl.Workbook:
-    if not xlsx_bytes.startswith(b"PK"):
-        raise AppError("Файл шаблона не похож на корректный XLSX.")
-
-    try:
-        return openpyxl.load_workbook(
-            io.BytesIO(xlsx_bytes),
-            data_only=False,
-            read_only=False,
-            keep_links=True,
-        )
-    except Exception as exc:
-        raise AppError(f"Не удалось открыть Excel-шаблон: {exc}") from exc
-
-
-# ---------------------------- LLM API --------------------------------------
 
 SYSTEM_PROMPT = """
-Ты извлекаешь структурированные данные из русского технического задания
-на закупку. Отвечай ТОЛЬКО JSON-объектом следующего вида:
+Ты — интеллектуальный модуль парсинга государственных закупок (ТЗ) на поставку мебели.
+Твоя задача — извлечь данные из текста ТЗ и вернуть строго валидный JSON:
 
 {
   "procurement_info": {
@@ -229,69 +176,174 @@ SYSTEM_PROMPT = """
 }
 
 Правила:
-1. Каждая НУМЕРОВАННАЯ позиция приложения «Перечень объектов закупки» —
-   отдельный объект, даже когда названия одинаковы. Не объединяй позиции
-   с разными номерами, размерами, материалами или количеством.
-2. Извлекай количество и единицу измерения именно товара, а не количество
-   ножек, мест или дней. Не придумывай отсутствующие значения.
-3. Сохраняй все индивидуальные характеристики позиции, в том числе
-   материалы, размеры, диапазоны, отрицания, цвет, особенности конструкции.
-   Передавай каждое требование отдельной строкой максимально близко
-   к исходной формулировке. Общие юридические разделы не включай.
-4. Адрес и срок бери из соответствующей позиции приложения; если они
-   указаны только в общих правилах без конкретного значения, верни null.
-5. Никаких цен, предполагаемого веса или характеристик «по аналогии».
-6. Для фрагмента, содержащего только продолжение позиции, сохраняй ее номер.
-   Не добавляй позиции, которых нет в тексте фрагмента.
+1. Каждая нумерованная товарная позиция приложения «Перечень объектов
+   закупки» — отдельный объект. Не объединяй одинаковые названия.
+2. Сохраняй номер позиции из документа. Не перенумеровывай товары.
+3. Количество и единицу измерения бери из строки объема товара, а не
+   из характеристик вроде количества мест или ножек.
+4. Сохраняй индивидуальные характеристики позиции отдельными строками,
+   включая материалы, габариты, диапазоны, цвет, отрицания и конструкцию.
+5. Общие юридические разделы не включай в характеристики товара.
+6. Адрес и срок бери из соответствующей позиции; если точного значения
+   нет, верни null. Ничего не придумывай.
+7. Цены, предполагаемую массу и параметры «по аналогии» не добавляй.
+8. Если фрагмент содержит только продолжение позиции, используй ее
+   действительный номер. Не добавляй позиции вне этого фрагмента.
 """.strip()
 
 
-def llm_post(model_name: str, messages: list[dict[str, str]]) -> dict[str, Any]:
-    config = MODEL_CONFIG[model_name]
-    provider = config["provider"]
+# ---------------------------------------------------------------------------
+# Чтение файлов
+# ---------------------------------------------------------------------------
 
-    if provider == "openai":
-        api_key = get_secret("OPENAI_API_KEY")
-        if not api_key:
-            raise AppError("Для GPT-4o-mini задайте OPENAI_API_KEY.")
+def read_uploaded_file(uploaded_file: Any, limit: int, label: str) -> bytes:
+    try:
+        data = uploaded_file.getvalue()
+    except Exception as exc:
+        raise AppError(f"Не удалось прочитать {label}: {exc}") from exc
 
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {api_key}"}
-        payload = {
-            "model": config["model"],
-            "temperature": 0,
-            "max_tokens": MAX_LLM_RESPONSE_TOKENS,
-            "response_format": {"type": "json_object"},
-            "messages": messages,
-        }
-    else:
-        api_key = get_secret("YANDEX_API_KEY")
-        iam_token = get_secret("YANDEX_IAM_TOKEN")
-        folder_id = get_secret("YANDEX_FOLDER_ID")
-        if not folder_id or not (api_key or iam_token):
+    if not data:
+        raise AppError(f"{label} пуст.")
+
+    if len(data) > limit:
+        raise AppError(
+            f"{label} превышает допустимый размер "
+            f"{limit // (1024 * 1024)} МБ."
+        )
+
+    return data
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise AppError("Файл не имеет корректной сигнатуры PDF.")
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+
+        if reader.is_encrypted:
+            raise AppError("Зашифрованный PDF не поддерживается.")
+
+        if len(reader.pages) > MAX_PDF_PAGES:
             raise AppError(
-                "Для YandexGPT задайте YANDEX_FOLDER_ID и "
-                "YANDEX_API_KEY либо YANDEX_IAM_TOKEN."
+                f"В PDF более {MAX_PDF_PAGES} страниц."
             )
 
-        url = (
-            "https://llm.api.cloud.yandex.net/"
-            "foundationModels/v1/completion"
+        pages: list[str] = []
+
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = page.extract_text(extraction_mode="layout") or ""
+
+            if text.strip():
+                pages.append(
+                    f"\n[СТРАНИЦА {page_number}]\n{text}"
+                )
+
+        result = "\n".join(pages).strip()
+
+    except AppError:
+        raise
+    except Exception as exc:
+        raise AppError(
+            f"Не удалось извлечь текст из PDF: {exc}"
+        ) from exc
+
+    if len(result) < 100:
+        raise AppError(
+            "В PDF почти нет извлекаемого текста. "
+            "Для сканированного документа сначала выполните OCR."
         )
-        authorization = (
-            f"Api-Key {api_key}" if api_key else f"Bearer {iam_token}"
+
+    return result
+
+
+def open_template(xlsx_bytes: bytes) -> openpyxl.Workbook:
+    if not xlsx_bytes.startswith(b"PK"):
+        raise AppError("Загруженный файл не похож на XLSX.")
+
+    try:
+        return openpyxl.load_workbook(
+            io.BytesIO(xlsx_bytes),
+            data_only=False,
+            read_only=False,
+            keep_links=True,
         )
-        headers = {"Authorization": authorization}
-        payload = {
-            "modelUri": f"gpt://{folder_id}/{config['model']}",
-            "completionOptions": {
-                "stream": False,
-                "temperature": 0,
-                "maxTokens": str(MAX_LLM_RESPONSE_TOKENS),
+    except Exception as exc:
+        raise AppError(
+            f"Не удалось открыть Excel-шаблон: {exc}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Настройки API и вызов модели
+# ---------------------------------------------------------------------------
+
+def normalize_base_url(provider: str, raw_url: str) -> str:
+    url = raw_url.strip().rstrip("/")
+
+    if not url:
+        raise AppError("Адрес API endpoint не указан.")
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise AppError(
+            "Endpoint должен быть полным URL, например "
+            "http://localhost:11434/v1."
+        )
+
+    if provider != "Свой endpoint" and parsed.scheme != "https":
+        raise AppError(
+            "Для публичного API требуется HTTPS."
+        )
+
+    if parsed.username or parsed.password:
+        raise AppError(
+            "Не помещайте учетные данные в URL endpoint."
+        )
+
+    return url
+
+
+def call_llm(
+    settings: LLMSettings,
+    user_prompt: str,
+) -> dict[str, Any]:
+    """
+    Все четыре варианта используют Chat Completions-совместимый endpoint.
+
+    response_format=json_object намеренно не включен: поддержка этого
+    параметра отличается у моделей и прокси. JSON строго запрашивается
+    промптом, затем проверяется на стороне приложения.
+    """
+    url = f"{settings.base_url}/chat/completions"
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    if settings.api_key:
+        headers["Authorization"] = f"Bearer {settings.api_key}"
+
+    if settings.provider == "OpenRouter":
+        headers["HTTP-Referer"] = "http://localhost:8501"
+        headers["X-Title"] = "Procurement TS to Excel"
+
+    payload = {
+        "model": settings.model,
+        "temperature": 0,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
             },
-            "messages": messages,
-            "jsonObject": True,
-        }
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
+    }
 
     try:
         response = requests.post(
@@ -303,43 +355,77 @@ def llm_post(model_name: str, messages: list[dict[str, str]]) -> dict[str, Any]:
         response.raise_for_status()
         body = response.json()
 
-        if provider == "openai":
-            content = body["choices"][0]["message"]["content"]
-        else:
-            content = body["result"]["alternatives"][0]["message"]["text"]
+        content = body["choices"][0]["message"]["content"]
 
-        if not isinstance(content, str):
-            raise ValueError("Ответ модели не содержит текстового JSON.")
-        parsed = json.loads(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("Корнем ответа должен быть JSON-объект.")
-        return parsed
+        if isinstance(content, list):
+            # Некоторые совместимые API отдают текст отдельными частями.
+            content = "".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict)
+            )
+
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("В ответе модели отсутствует текст.")
+
+        return parse_json_response(content)
 
     except requests.Timeout as exc:
         raise AppError(
-            f"Превышено время ожидания API модели {model_name}."
+            f"Превышено время ожидания API: "
+            f"{settings.provider} / {settings.model}."
         ) from exc
+
     except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response else "неизвестен"
-        # Тело ответа не показываем: оно может содержать служебные данные.
+        status = (
+            exc.response.status_code
+            if exc.response is not None
+            else "неизвестен"
+        )
         raise AppError(
-            f"API модели {model_name} вернул HTTP {status}. "
-            "Проверьте доступ, квоты и настройки модели."
+            f"API {settings.provider} вернул HTTP {status} для модели "
+            f"«{settings.model}». Проверьте API-ключ, доступность "
+            "идентификатора модели, лимиты и URL endpoint."
         ) from exc
+
     except requests.RequestException as exc:
-        raise AppError(f"Сетевая ошибка API модели {model_name}: {exc}") from exc
-    except (KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
         raise AppError(
-            f"Модель {model_name} вернула некорректный структурированный ответ: "
+            f"Ошибка подключения к {settings.provider}: {exc}"
+        ) from exc
+
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise AppError(
+            f"Модель «{settings.model}» вернула некорректный ответ: "
             f"{exc}"
         ) from exc
 
 
-def split_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
-    """
-    Делит текст по страницам/абзацам. Фрагменты перекрываются коротким
-    контекстом: это помогает не потерять заголовок позиции на границе.
-    """
+def parse_json_response(content: str) -> dict[str, Any]:
+    text = content.strip()
+
+    # Допускаем только распространенную обертку ```json ... ```.
+    # Произвольный текст вокруг JSON не принимаем.
+    fenced = re.fullmatch(
+        r"```(?:json)?\s*(\{.*\})\s*```",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    if fenced:
+        text = fenced.group(1)
+
+    parsed = json.loads(text)
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Корнем ответа должен быть JSON-объект.")
+
+    return parsed
+
+
+def split_text(
+    text: str,
+    max_chars: int = MAX_CHUNK_CHARS,
+) -> list[str]:
     if len(text) <= max_chars:
         return [text]
 
@@ -349,6 +435,7 @@ def split_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
 
     for paragraph in paragraphs:
         paragraph = paragraph.strip()
+
         if not paragraph:
             continue
 
@@ -356,66 +443,129 @@ def split_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
             if current:
                 chunks.append(current)
                 current = ""
-            for start in range(0, len(paragraph), max_chars - 500):
-                chunks.append(paragraph[start:start + max_chars])
+
+            step = max_chars - 500
+
+            for start in range(0, len(paragraph), step):
+                chunks.append(
+                    paragraph[start:start + max_chars]
+                )
+
             continue
 
-        proposed = f"{current}\n\n{paragraph}" if current else paragraph
-        if len(proposed) > max_chars and current:
+        candidate = (
+            f"{current}\n\n{paragraph}"
+            if current
+            else paragraph
+        )
+
+        if len(candidate) > max_chars and current:
             chunks.append(current)
-            current = f"[КОНТЕКСТ ПРЕДЫДУЩЕГО ФРАГМЕНТА]\n{current[-500:]}\n\n{paragraph}"
+
+            context = current[-500:]
+
+            current = (
+                "[КОНТЕКСТ ПРЕДЫДУЩЕГО ФРАГМЕНТА]\n"
+                f"{context}\n\n{paragraph}"
+            )
         else:
-            current = proposed
+            current = candidate
 
     if current:
         chunks.append(current)
+
     return chunks
 
 
-def clean_text(value: Any, field: str, nullable: bool = False) -> str | None:
+def clean_text(
+    value: Any,
+    field: str,
+    nullable: bool = False,
+) -> str | None:
     if value is None and nullable:
         return None
+
     if not isinstance(value, str):
-        raise AppError(f"Поле «{field}» имеет неверный тип.")
+        raise AppError(
+            f"Поле «{field}» имеет неверный тип."
+        )
+
     result = re.sub(r"\s+", " ", value).strip()
+
     if not result and not nullable:
-        raise AppError(f"Обязательное поле «{field}» пусто.")
+        raise AppError(
+            f"Обязательное поле «{field}» пусто."
+        )
+
     return result or None
 
 
 def validate_llm_item(raw: Any) -> ProcurementItem:
     if not isinstance(raw, dict):
-        raise AppError("Одна из позиций LLM не является JSON-объектом.")
+        raise AppError(
+            "Одна из позиций ответа модели не является JSON-объектом."
+        )
 
     number = raw.get("position_number")
-    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-        raise AppError("У позиции отсутствует корректный position_number.")
+
+    if (
+        isinstance(number, bool)
+        or not isinstance(number, int)
+        or number < 1
+    ):
+        raise AppError(
+            "Некорректный номер одной из позиций."
+        )
 
     quantity = raw.get("quantity")
+
     if (
         isinstance(quantity, bool)
         or not isinstance(quantity, (int, float))
         or not 0 < float(quantity) < 1_000_000_000
     ):
-        raise AppError(f"Позиция №{number}: некорректное количество.")
+        raise AppError(
+            f"Позиция №{number}: некорректное количество."
+        )
 
     characteristics = raw.get("characteristics")
-    if not isinstance(characteristics, list) or not characteristics:
-        raise AppError(f"Позиция №{number}: отсутствуют характеристики.")
 
-    cleaned: list[str] = []
+    if (
+        not isinstance(characteristics, list)
+        or not characteristics
+    ):
+        raise AppError(
+            f"Позиция №{number}: отсутствуют характеристики."
+        )
+
+    unique_lines: list[str] = []
     seen: set[str] = set()
-    for value in characteristics:
-        line = clean_text(value, f"характеристика позиции №{number}")
-        assert line is not None
-        key = line.casefold()
-        if key not in seen:
-            seen.add(key)
-            cleaned.append(line)
 
-    name = clean_text(raw.get("object_name"), "object_name")
-    unit = clean_text(raw.get("unit"), "unit")
-    assert name is not None and unit is not None
+    for raw_line in characteristics:
+        line = clean_text(
+            raw_line,
+            f"характеристика позиции №{number}",
+        )
+
+        assert line is not None
+
+        normalized = line.casefold()
+
+        if normalized not in seen:
+            seen.add(normalized)
+            unique_lines.append(line)
+
+    name = clean_text(
+        raw.get("object_name"),
+        "object_name",
+    )
+    unit = clean_text(
+        raw.get("unit"),
+        "unit",
+    )
+
+    assert name is not None
+    assert unit is not None
 
     return ProcurementItem(
         position_number=number,
@@ -432,64 +582,61 @@ def validate_llm_item(raw: Any) -> ProcurementItem:
             "delivery_deadline",
             nullable=True,
         ),
-        characteristics=tuple(cleaned),
+        characteristics=tuple(unique_lines),
     )
 
 
-def extract_items_with_llm(text: str, model_name: str) -> list[ProcurementItem]:
+def extract_items_with_llm(
+    text: str,
+    settings: LLMSettings,
+) -> list[ProcurementItem]:
     chunks = split_text(text)
     merged: dict[int, ProcurementItem] = {}
 
     for index, chunk in enumerate(chunks, start=1):
-        result = llm_post(
-            model_name,
-            [
-                {"role": "system", "text": SYSTEM_PROMPT}
-                if MODEL_CONFIG[model_name]["provider"] == "yandex"
-                else {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    **(
-                        {"text": f"Фрагмент {index}/{len(chunks)}:\n\n{chunk}"}
-                        if MODEL_CONFIG[model_name]["provider"] == "yandex"
-                        else {
-                            "content": (
-                                f"Фрагмент {index}/{len(chunks)}:\n\n{chunk}"
-                            )
-                        }
-                    ),
-                },
-            ],
+        result = call_llm(
+            settings,
+            (
+                f"Фрагмент документа {index}/{len(chunks)}.\n"
+                "Извлеки позиции только из этого фрагмента.\n\n"
+                f"{chunk}"
+            ),
         )
 
         raw_items = result.get("items")
+
         if not isinstance(raw_items, list):
             raise AppError(
-                f"Фрагмент {index}: ответ модели не содержит массив items."
+                f"Фрагмент {index}: ответ модели "
+                "не содержит массив items."
             )
 
-        for raw in raw_items:
-            item = validate_llm_item(raw)
+        for raw_item in raw_items:
+            item = validate_llm_item(raw_item)
             previous = merged.get(item.position_number)
 
             if previous is None:
                 merged[item.position_number] = item
                 continue
 
-            # Повтор позиции возможен на границе фрагментов. Разные количества
-            # либо названия — повод остановиться, а не молча выбрать одно.
             if (
-                previous.object_name.casefold() != item.object_name.casefold()
+                previous.object_name.casefold()
+                != item.object_name.casefold()
                 or previous.quantity != item.quantity
-                or previous.unit.casefold() != item.unit.casefold()
+                or previous.unit.casefold()
+                != item.unit.casefold()
             ):
                 raise AppError(
-                    f"Противоречивые данные LLM для позиции "
-                    f"№{item.position_number}. Проверьте PDF."
+                    "Модель вернула противоречивые данные "
+                    f"для позиции №{item.position_number}."
                 )
 
             combined = list(previous.characteristics)
-            existing = {line.casefold() for line in combined}
+            existing = {
+                line.casefold()
+                for line in combined
+            }
+
             for line in item.characteristics:
                 if line.casefold() not in existing:
                     combined.append(line)
@@ -501,45 +648,66 @@ def extract_items_with_llm(text: str, model_name: str) -> list[ProcurementItem]:
                 quantity=previous.quantity,
                 unit=previous.unit,
                 delivery_address=(
-                    previous.delivery_address or item.delivery_address
+                    previous.delivery_address
+                    or item.delivery_address
                 ),
                 delivery_deadline=(
-                    previous.delivery_deadline or item.delivery_deadline
+                    previous.delivery_deadline
+                    or item.delivery_deadline
                 ),
                 characteristics=tuple(combined),
             )
 
     if not merged:
-        raise AppError("Модель не нашла товарных позиций в PDF.")
+        raise AppError(
+            "Модель не обнаружила товарных позиций в PDF."
+        )
 
-    return [merged[number] for number in sorted(merged)]
+    return [
+        merged[number]
+        for number in sorted(merged)
+    ]
 
 
-# ------------------------- Проверка шаблона --------------------------------
+# ---------------------------------------------------------------------------
+# Работа с Excel
+# ---------------------------------------------------------------------------
 
 def item_number(value: Any) -> int | None:
     if not isinstance(value, str):
         return None
+
     match = ITEM_NUMBER_RE.match(value)
-    return int(match.group(1)) if match else None
+
+    if not match:
+        return None
+
+    return int(match.group(1))
 
 
-def find_header_row(ws: openpyxl.worksheet.worksheet.Worksheet) -> int:
-    """Находит строку заголовка конкретной таблицы, не предполагая ее номер."""
+def find_header_row(
+    ws: openpyxl.worksheet.worksheet.Worksheet,
+) -> int:
     for row in ws.iter_rows(
         min_row=1,
         max_row=min(ws.max_row, 30),
         max_col=min(ws.max_column, 7),
     ):
         values = [
-            str(cell.value or "").replace("\n", " ").casefold()
+            str(cell.value or "")
+            .replace("\n", " ")
+            .casefold()
             for cell in row
         ]
-        if any("наименование товара из тз" in value for value in values):
+
+        if any(
+            "наименование товара из тз" in value
+            for value in values
+        ):
             return row[0].row
 
     raise AppError(
-        f"Лист «{ws.title}»: не найден ожидаемый заголовок "
+        f"Лист «{ws.title}»: не найден заголовок "
         "«Наименование товара из ТЗ»."
     )
 
@@ -548,139 +716,163 @@ def detect_blocks(
     ws: openpyxl.worksheet.worksheet.Worksheet,
     header_row: int,
 ) -> list[RowBlock]:
-    """
-    Границы блока — следующая пронумерованная позиция либо строка итогов.
-    Строки заголовков и итогов не попадают в доступный диапазон.
-    """
-    starts: list[tuple[int, int, str]] = []
+    starts: list[tuple[int, int]] = []
     stop_row = ws.max_row + 1
 
     for row in range(header_row + 1, ws.max_row + 1):
         value = ws.cell(row, 1).value
         number = item_number(value)
+
         if number is not None:
-            original = str(value)
-            name = re.sub(
-                r"^\s*\d{1,4}\s*[.)]\s*",
-                "",
-                original,
-                count=1,
-            ).strip()
-            starts.append((row, number, name))
-        elif starts and isinstance(value, str):
-            lowered = value.strip().casefold()
-            if lowered.startswith(("итого", "итоговая", "всего")):
+            starts.append((row, number))
+            continue
+
+        if starts and isinstance(value, str):
+            if value.strip().casefold().startswith(
+                ("итого", "итоговая", "всего")
+            ):
                 stop_row = row
                 break
 
     if not starts:
         raise AppError(
-            f"Лист «{ws.title}»: не найдены нумерованные товарные блоки."
+            f"Лист «{ws.title}»: "
+            "не найдены пронумерованные товарные блоки."
         )
 
-    numbers = [number for _, number, _ in starts]
-    if len(numbers) != len(set(numbers)):
-        raise AppError(
-            f"Лист «{ws.title}»: повторяются номера товарных блоков."
-        )
-
-    return [
-        RowBlock(
-            position_number=number,
-            first_row=row,
-            last_row=(
-                starts[index + 1][0] - 1
-                if index + 1 < len(starts)
-                else stop_row - 1
-            ),
-            existing_name=name,
-        )
-        for index, (row, number, name) in enumerate(starts)
+    numbers = [
+        number
+        for _, number in starts
     ]
 
+    if len(numbers) != len(set(numbers)):
+        raise AppError(
+            f"Лист «{ws.title}»: "
+            "номера товарных блоков повторяются."
+        )
 
-def assert_editable(ws: Any, row: int, column: int) -> None:
+    blocks: list[RowBlock] = []
+
+    for index, (first_row, number) in enumerate(starts):
+        last_row = (
+            starts[index + 1][0] - 1
+            if index + 1 < len(starts)
+            else stop_row - 1
+        )
+
+        blocks.append(
+            RowBlock(
+                position_number=number,
+                first_row=first_row,
+                last_row=last_row,
+            )
+        )
+
+    return blocks
+
+
+def assert_editable(
+    ws: openpyxl.worksheet.worksheet.Worksheet,
+    row: int,
+    column: int,
+) -> None:
     cell = ws.cell(row, column)
+
     if isinstance(cell, MergedCell):
         raise AppError(
             f"Нельзя записать в объединенную ячейку "
-            f"{ws.title}!{get_column_letter(column)}{row}."
+            f"«{ws.title}!{cell.coordinate}»."
         )
-    if cell.data_type == "f" or (
-        isinstance(cell.value, str) and cell.value.startswith("=")
+
+    if (
+        cell.data_type == "f"
+        or (
+            isinstance(cell.value, str)
+            and cell.value.startswith("=")
+        )
     ):
         raise AppError(
-            f"Ячейка {ws.title}!{cell.coordinate} содержит формулу. "
-            "Изменения отменены."
+            f"Ячейка «{ws.title}!{cell.coordinate}» "
+            "содержит формулу."
         )
 
 
 def set_cell(
-    ws: Any,
+    ws: openpyxl.worksheet.worksheet.Worksheet,
     row: int,
     column: int,
-    value: str | float | int | None,
+    value: str | int | float | None,
 ) -> None:
     assert_editable(ws, row, column)
     ws.cell(row, column).value = value
 
 
-def assert_has_capacity(
-    ws: Any,
+def check_capacity(
+    ws: openpyxl.worksheet.worksheet.Worksheet,
     block: RowBlock,
-    required_lines: int,
+    needed: int,
 ) -> None:
-    available = block.last_row - block.first_row + 1
-    if required_lines > available:
+    capacity = (
+        block.last_row
+        - block.first_row
+        + 1
+    )
+
+    if needed > capacity:
         raise AppError(
-            f"Лист «{ws.title}», позиция №{block.position_number}: "
-            f"нужно {required_lines} строк характеристик, в шаблоне "
-            f"доступно {available}. Подготовьте шаблон с большим блоком; "
-            "автоматическая вставка строк отключена для защиты формул."
+            f"Лист «{ws.title}», позиция "
+            f"№{block.position_number}: "
+            f"требуется {needed} строк, доступно {capacity}. "
+            "Подготовьте более вместительный шаблон. "
+            "Вставка строк отключена для защиты формул."
         )
 
 
-def validate_mapping(
-    workbook: openpyxl.Workbook,
-    items: list[ProcurementItem],
-) -> dict[str, dict[int, RowBlock]]:
-    needed = {PRICE_SHEET, LOGISTICS_SHEET, ECONOMICS_SHEET}
-    missing_sheets = needed.difference(workbook.sheetnames)
-    if missing_sheets:
-        raise AppError(
-            "В шаблоне отсутствуют листы: "
-            + ", ".join(sorted(missing_sheets))
+def write_characteristics(
+    ws: openpyxl.worksheet.worksheet.Worksheet,
+    block: RowBlock,
+    column: int,
+    values: list[str],
+) -> None:
+    check_capacity(
+        ws,
+        block,
+        len(values),
+    )
+
+    for row in range(
+        block.first_row,
+        block.last_row + 1,
+    ):
+        assert_editable(
+            ws,
+            row,
+            column,
         )
 
-    mappings: dict[str, dict[int, RowBlock]] = {}
-    for sheet_name in (PRICE_SHEET, LOGISTICS_SHEET, ECONOMICS_SHEET):
-        ws = workbook[sheet_name]
-        blocks = detect_blocks(ws, find_header_row(ws))
-        mappings[sheet_name] = {
-            block.position_number: block for block in blocks
-        }
+    for index, value in enumerate(values):
+        set_cell(
+            ws,
+            block.first_row + index,
+            column,
+            value,
+        )
 
-    pdf_numbers = {item.position_number for item in items}
-    for sheet_name, mapping in mappings.items():
-        template_numbers = set(mapping)
-        if pdf_numbers != template_numbers:
-            missing = sorted(pdf_numbers - template_numbers)
-            surplus = sorted(template_numbers - pdf_numbers)
-            raise AppError(
-                f"Лист «{sheet_name}»: позиции PDF и шаблона не совпадают. "
-                f"Нет блоков для {missing}; лишние блоки {surplus}. "
-                "Шаблон с другими закупочными позициями нужно сначала "
-                "адаптировать. Подмена по порядку небезопасна."
-            )
-
-    return mappings
+    for row in range(
+        block.first_row + len(values),
+        block.last_row + 1,
+    ):
+        set_cell(
+            ws,
+            row,
+            column,
+            None,
+        )
 
 
-def dimensions_only(characteristics: tuple[str, ...]) -> list[str]:
-    """
-    Лист логистики содержит только строки габаритов; количество мест,
-    масса нагрузки и размеры упаковки не подменяют размеры изделия.
-    """
+def dimension_characteristics(
+    characteristics: tuple[str, ...],
+) -> list[str]:
     prefixes = (
         "высота",
         "глубина",
@@ -689,64 +881,130 @@ def dimensions_only(characteristics: tuple[str, ...]) -> list[str]:
         "толщина",
         "диаметр",
     )
+
     return [
-        line for line in characteristics
+        line
+        for line in characteristics
         if line.casefold().startswith(prefixes)
     ]
 
 
-def write_characteristics(
-    ws: Any,
-    block: RowBlock,
-    column: int,
-    values: list[str],
-) -> None:
-    assert_has_capacity(ws, block, len(values))
+def validate_template_mapping(
+    workbook: openpyxl.Workbook,
+    items: list[ProcurementItem],
+) -> dict[str, dict[int, RowBlock]]:
+    required_sheets = {
+        PRICE_SHEET,
+        LOGISTICS_SHEET,
+        ECONOMICS_SHEET,
+    }
 
-    # Очистка остатка старого блока выполняется только после проверки
-    # каждой ячейки. Формулы, если они здесь есть, вызывают отказ.
-    for row in range(block.first_row, block.last_row + 1):
-        assert_editable(ws, row, column)
+    missing_sheets = (
+        required_sheets
+        - set(workbook.sheetnames)
+    )
 
-    for offset, line in enumerate(values):
-        set_cell(ws, block.first_row + offset, column, line)
-    for row in range(block.first_row + len(values), block.last_row + 1):
-        set_cell(ws, row, column, None)
+    if missing_sheets:
+        raise AppError(
+            "В шаблоне отсутствуют листы: "
+            + ", ".join(sorted(missing_sheets))
+        )
+
+    result: dict[str, dict[int, RowBlock]] = {}
+
+    for sheet_name in (
+        PRICE_SHEET,
+        LOGISTICS_SHEET,
+        ECONOMICS_SHEET,
+    ):
+        ws = workbook[sheet_name]
+        header_row = find_header_row(ws)
+        blocks = detect_blocks(ws, header_row)
+
+        result[sheet_name] = {
+            block.position_number: block
+            for block in blocks
+        }
+
+    pdf_numbers = {
+        item.position_number
+        for item in items
+    }
+
+    for sheet_name, mapping in result.items():
+        template_numbers = set(mapping)
+
+        if template_numbers != pdf_numbers:
+            missing = sorted(
+                pdf_numbers - template_numbers
+            )
+            surplus = sorted(
+                template_numbers - pdf_numbers
+            )
+
+            raise AppError(
+                f"Лист «{sheet_name}» не соответствует PDF. "
+                f"Отсутствующие блоки: {missing}; "
+                f"лишние блоки: {surplus}. "
+                "Автоматическая подмена позиций "
+                "другой закупки запрещена."
+            )
+
+    return result
 
 
 def populate_workbook(
     workbook: openpyxl.Workbook,
     items: list[ProcurementItem],
 ) -> None:
-    mapping = validate_mapping(workbook, items)
+    mapping = validate_template_mapping(
+        workbook,
+        items,
+    )
+
     prices = workbook[PRICE_SHEET]
     logistics = workbook[LOGISTICS_SHEET]
     economics = workbook[ECONOMICS_SHEET]
 
-    # Лист «Доп.информация» примера содержит текст ДРУГОЙ закупки;
-    # служебные листы — старые габариты и оценки. Не меняем их автоматически.
-    # Пользователю необходимо проверить эти листы отдельно.
-
     for item in items:
-        price_block = mapping[PRICE_SHEET][item.position_number]
-        logistics_block = mapping[LOGISTICS_SHEET][item.position_number]
-        economics_block = mapping[ECONOMICS_SHEET][item.position_number]
+        price_block = mapping[PRICE_SHEET][
+            item.position_number
+        ]
 
-        price_name = (
-            f"{item.position_number}.\n{item.object_name}"
+        logistics_block = mapping[
+            LOGISTICS_SHEET
+        ][item.position_number]
+
+        economics_block = mapping[
+            ECONOMICS_SHEET
+        ][item.position_number]
+
+        name_cell_value = (
+            f"{item.position_number}.\n"
+            f"{item.object_name}"
         )
+
         quantity: int | float = (
             int(item.quantity)
             if item.quantity.is_integer()
             else item.quantity
         )
 
-        # «Цены изделий (входящие)»:
-        # A — номер и название; D — характеристики; E — количество.
-        # B, C, F:I оставляем нетронутыми: поставщик, изображения, цены
-        # и вычисляемые суммы не извлекаются из ТЗ.
-        set_cell(prices, price_block.first_row, 1, price_name)
-        set_cell(prices, price_block.first_row, 5, quantity)
+        # Цены изделий:
+        # A — номер/название, D — характеристики, E — количество.
+        # Цены, изображения, данные поставщика и суммы не трогаем.
+        set_cell(
+            prices,
+            price_block.first_row,
+            1,
+            name_cell_value,
+        )
+        set_cell(
+            prices,
+            price_block.first_row,
+            5,
+            quantity,
+        )
         write_characteristics(
             prices,
             price_block,
@@ -754,98 +1012,228 @@ def populate_workbook(
             list(item.characteristics),
         )
 
-        # «Логистика и пр. расходы»:
-        # A — позиция; C — размерные характеристики; D — количество;
-        # E — единица. Расчетные объемы и массы не трогаем.
-        set_cell(logistics, logistics_block.first_row, 1, price_name)
-        set_cell(logistics, logistics_block.first_row, 4, quantity)
-        set_cell(logistics, logistics_block.first_row, 5, item.unit)
+        # Логистика:
+        # A — номер/название, C — размерные характеристики,
+        # D — количество, E — единица.
+        set_cell(
+            logistics,
+            logistics_block.first_row,
+            1,
+            name_cell_value,
+        )
+        set_cell(
+            logistics,
+            logistics_block.first_row,
+            4,
+            quantity,
+        )
+        set_cell(
+            logistics,
+            logistics_block.first_row,
+            5,
+            item.unit,
+        )
         write_characteristics(
             logistics,
             logistics_block,
             3,
-            dimensions_only(item.characteristics),
+            dimension_characteristics(
+                item.characteristics
+            ),
         )
 
-        # «Экономика»: обновляем только идентификатор и количество.
-        # Цены, прибыль, источники товара и их формулы сохраняются.
-        set_cell(economics, economics_block.first_row, 1, price_name)
-        set_cell(economics, economics_block.first_row, 3, quantity)
+        # Экономика: только идентификатор и количество.
+        # Цены, источники товара и расчетные поля сохраняем.
+        set_cell(
+            economics,
+            economics_block.first_row,
+            1,
+            name_cell_value,
+        )
+        set_cell(
+            economics,
+            economics_block.first_row,
+            3,
+            quantity,
+        )
 
-    # Excel пересчитает сохраненные формулы при открытии. openpyxl
-    # вычислять формулы не умеет.
+    # Просим Excel пересчитать сохраненные формулы при открытии.
+    # Сам openpyxl значения формул не вычисляет.
     try:
-        workbook.calculation = openpyxl.workbook.properties.CalcProperties(
-            calcMode="auto",
-            fullCalcOnLoad=True,
-            forceFullCalc=True,
+        workbook.calculation = (
+            openpyxl.workbook.properties.CalcProperties(
+                calcMode="auto",
+                fullCalcOnLoad=True,
+                forceFullCalc=True,
+            )
         )
     except AttributeError:
-        # Для версий openpyxl с другим интерфейсом расчета не меняем
-        # настройки книги: сами формулы остаются сохраненными.
         pass
 
 
-def workbook_to_bytes(workbook: openpyxl.Workbook) -> bytes:
+def save_workbook(
+    workbook: openpyxl.Workbook,
+) -> bytes:
     try:
         output = io.BytesIO()
         workbook.save(output)
         result = output.getvalue()
+
         if not result:
-            raise ValueError("Получен пустой XLSX.")
+            raise ValueError(
+                "Получен пустой XLSX."
+            )
+
         return result
+
     except Exception as exc:
-        raise AppError(f"Не удалось сохранить заполненный XLSX: {exc}") from exc
+        raise AppError(
+            f"Не удалось сохранить XLSX: {exc}"
+        ) from exc
 
 
-def items_to_dataframe(items: list[ProcurementItem]) -> pd.DataFrame:
+def items_dataframe(
+    items: list[ProcurementItem],
+) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
                 "№": item.position_number,
-                "Объект закупки": item.object_name,
+                "Объект": item.object_name,
                 "Количество": item.quantity,
                 "Ед. изм.": item.unit,
-                "Адрес поставки": item.delivery_address or "Не указан",
-                "Срок поставки": item.delivery_deadline or "Не указан",
-                "Характеристик": len(item.characteristics),
+                "Адрес поставки": (
+                    item.delivery_address
+                    or "Не указан"
+                ),
+                "Срок поставки": (
+                    item.delivery_deadline
+                    or "Не указан"
+                ),
+                "Характеристик": len(
+                    item.characteristics
+                ),
             }
             for item in items
         ]
     )
 
 
-# ------------------------------ Streamlit ----------------------------------
+# ---------------------------------------------------------------------------
+# Интерфейс
+# ---------------------------------------------------------------------------
+
+def provider_settings_ui() -> LLMSettings:
+    st.sidebar.header("Модель анализа")
+
+    provider = st.sidebar.selectbox(
+        "Провайдер",
+        list(PROVIDERS),
+    )
+
+    config = PROVIDERS[provider]
+
+    model_choice = st.sidebar.selectbox(
+        "Модель",
+        [
+            *config["models"],
+            "Указать модель вручную…",
+        ],
+        key=f"model_choice_{provider}",
+    )
+
+    if model_choice == "Указать модель вручную…":
+        model = st.sidebar.text_input(
+            "Идентификатор модели в API",
+            key=f"custom_model_{provider}",
+        ).strip()
+    else:
+        model = model_choice
+
+    if provider == "Свой endpoint":
+        raw_base_url = st.sidebar.text_input(
+            "Base URL Chat Completions API",
+            value=config["base_url"],
+            help=(
+                "Например, http://localhost:11434/v1. "
+                "Приложение вызовет /chat/completions."
+            ),
+        )
+    else:
+        raw_base_url = config["base_url"]
+
+        st.sidebar.caption(
+            f"API endpoint: `{raw_base_url}`"
+        )
+
+    api_key = st.sidebar.text_input(
+        "API-ключ",
+        type="password",
+        key=f"api_key_{provider}",
+        help=(
+            "Ключ используется только для текущих запросов. "
+            "Для локального endpoint без авторизации "
+            "поле можно оставить пустым."
+        ),
+    )
+
+    if not model:
+        raise AppError(
+            "Укажите идентификатор модели."
+        )
+
+    if (
+        provider != "Свой endpoint"
+        and not api_key.strip()
+    ):
+        raise AppError(
+            f"Для провайдера {provider} "
+            "необходимо указать API-ключ."
+        )
+
+    return LLMSettings(
+        provider=provider,
+        model=model,
+        base_url=normalize_base_url(
+            provider,
+            raw_base_url,
+        ),
+        api_key=api_key.strip(),
+    )
+
 
 def main() -> None:
     st.set_page_config(
-        page_title="Техническое задание → Excel",
+        page_title="ТЗ → Excel",
         page_icon="📋",
         layout="wide",
     )
-    st.title("Техническое задание → Excel-шаблон")
-    st.write(
-        "Загрузите PDF с текстовым слоем и подготовленный XLSX-шаблон. "
-        "Товары сопоставляются по номерам позиций, а не по совпадению названий."
+
+    st.title(
+        "Техническое задание → Excel-шаблон"
     )
 
-    model_name = st.sidebar.selectbox(
-        "Модель для обработки текста",
-        list(MODEL_CONFIG),
+    st.write(
+        "Выберите провайдера и модель, укажите API-ключ, "
+        "загрузите PDF и подготовленный XLSX-шаблон."
     )
-    st.sidebar.caption(
-        "Ключи API задаются через переменные окружения или "
-        ".streamlit/secrets.toml."
-    )
+
+    try:
+        settings = provider_settings_ui()
+    except AppError as exc:
+        st.sidebar.error(str(exc))
+        return
 
     st.subheader("Исходные файлы")
+
     pdf_upload = st.file_uploader(
         "Техническое задание, PDF",
         type=["pdf"],
         key="pdf_upload",
     )
+
     xlsx_upload = st.file_uploader(
-        "Предварительно подготовленный шаблон, XLSX",
+        "Подготовленный Excel-шаблон, XLSX",
         type=["xlsx"],
         key="xlsx_upload",
     )
@@ -853,81 +1241,155 @@ def main() -> None:
     if not pdf_upload or not xlsx_upload:
         return
 
-    # Хеш входов предотвращает выдачу результата, созданного для других
-    # файлов или другой модели, после изменения загрузки/выбора.
     try:
         pdf_bytes = read_uploaded_file(
-            pdf_upload, MAX_PDF_BYTES, "PDF-файл"
+            pdf_upload,
+            MAX_PDF_BYTES,
+            "PDF-файл",
         )
         xlsx_bytes = read_uploaded_file(
-            xlsx_upload, MAX_XLSX_BYTES, "Excel-шаблон"
+            xlsx_upload,
+            MAX_XLSX_BYTES,
+            "Excel-шаблон",
         )
     except AppError as exc:
         st.error(str(exc))
         return
 
+    # Отпечаток зависит и от ключа: после его замены старый результат
+    # не будет ошибочно показан как результат нового запуска.
+    # Сам ключ не сохраняется в отпечатке в открытом виде.
     fingerprint = hashlib.sha256(
-        pdf_bytes + b"\0" + xlsx_bytes + b"\0" + model_name.encode()
+        b"\0".join(
+            [
+                pdf_bytes,
+                xlsx_bytes,
+                settings.provider.encode(),
+                settings.model.encode(),
+                settings.base_url.encode(),
+                settings.api_key.encode(),
+            ]
+        )
     ).hexdigest()
 
-    if st.session_state.get("result_fingerprint") != fingerprint:
-        st.session_state.pop("result_binary", None)
-        st.session_state.pop("result_dataframe", None)
-        st.session_state.pop("result_fingerprint", None)
+    if (
+        st.session_state.get(
+            "result_fingerprint"
+        )
+        != fingerprint
+    ):
+        st.session_state.pop(
+            "result_binary",
+            None,
+        )
+        st.session_state.pop(
+            "result_dataframe",
+            None,
+        )
+        st.session_state.pop(
+            "result_fingerprint",
+            None,
+        )
+
+    already_generated = bool(
+        st.session_state.get(
+            "result_binary"
+        )
+    )
 
     if st.button(
-        "Извлечь данные и заполнить шаблон",
+        "Проанализировать и заполнить шаблон",
         type="primary",
-        disabled=bool(st.session_state.get("result_binary")),
+        disabled=already_generated,
     ):
-        with st.spinner("Чтение PDF, обработка моделью и проверка шаблона…"):
+        with st.spinner(
+            "Извлекаем текст, вызываем модель "
+            "и проверяем шаблон…"
+        ):
             try:
-                text = extract_pdf_text(pdf_bytes)
-                items = extract_items_with_llm(text, model_name)
-                workbook = open_template(xlsx_bytes)
-                populate_workbook(workbook, items)
-                result_binary = workbook_to_bytes(workbook)
-
-                st.session_state["result_binary"] = result_binary
-                st.session_state["result_dataframe"] = items_to_dataframe(
-                    items
+                pdf_text = extract_pdf_text(
+                    pdf_bytes
                 )
-                st.session_state["result_fingerprint"] = fingerprint
+
+                items = extract_items_with_llm(
+                    pdf_text,
+                    settings,
+                )
+
+                workbook = open_template(
+                    xlsx_bytes
+                )
+
+                populate_workbook(
+                    workbook,
+                    items,
+                )
+
+                result_binary = save_workbook(
+                    workbook
+                )
+
+                st.session_state[
+                    "result_binary"
+                ] = result_binary
+
+                st.session_state[
+                    "result_dataframe"
+                ] = items_dataframe(items)
+
+                st.session_state[
+                    "result_fingerprint"
+                ] = fingerprint
 
             except AppError as exc:
                 st.error(str(exc))
+
             except Exception as exc:
                 st.error(
-                    "Непредвиденная ошибка обработки. "
-                    f"Подробности: {type(exc).__name__}: {exc}"
+                    "Непредвиденная ошибка: "
+                    f"{type(exc).__name__}: {exc}"
                 )
 
-    if st.session_state.get("result_binary"):
-        st.success("Файл подготовлен.")
-        st.subheader("Извлеченные позиции")
+    if st.session_state.get(
+        "result_binary"
+    ):
+        st.success(
+            "Заполненный файл подготовлен."
+        )
+
+        st.subheader(
+            "Извлеченные позиции"
+        )
+
         st.dataframe(
-            st.session_state["result_dataframe"],
+            st.session_state[
+                "result_dataframe"
+            ],
             use_container_width=True,
             hide_index=True,
         )
 
         st.warning(
-            "Проверьте результат перед использованием: существующие цены, "
-            "массы, объемы, тексты листа «Доп.информация» и служебные "
-            "расчеты шаблона могли относиться к другой закупке. "
-            "Приложение намеренно не заменяет их предположениями ИИ. "
-            "Формулы пересчитываются Excel при открытии файла."
+            "Проверьте результат перед использованием. "
+            "Старые цены, масса, объемы, расчеты "
+            "и тексты служебных листов шаблона "
+            "могут относиться к другой закупке. "
+            "Формулы пересчитываются Excel "
+            "при открытии файла."
         )
 
         st.download_button(
             label="Скачать заполненный XLSX",
-            data=st.session_state["result_binary"],
-            file_name="ТЗ_заполненный_шаблон.xlsx",
+            data=st.session_state[
+                "result_binary"
+            ],
+            file_name=(
+                "ТЗ_заполненный_шаблон.xlsx"
+            ),
             mime=(
                 "application/vnd.openxmlformats-officedocument."
                 "spreadsheetml.sheet"
             ),
-            key="download_result",
         )
 
 
