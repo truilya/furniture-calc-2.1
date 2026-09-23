@@ -901,6 +901,14 @@ def validate_item(
         ),
     )
 
+    st.write(
+        f"Диагностика позиции №{number}:",
+        {
+            "quantity": raw.get("quantity"),
+            "unit": raw.get("unit"),
+        },
+    )
+
     quantity, unit = parse_quantity_and_unit(
         raw.get("quantity"),
         raw.get("unit"),
@@ -1257,6 +1265,15 @@ def extract_data_with_llm(
             )
 
         for raw_item in raw_items:
+
+            st.write(
+                f"Диагностика позиции №{number}:",
+                {
+                    "quantity": raw.get("quantity"),
+                    "unit": raw.get("unit"),
+                },
+            )
+
             item = validate_item(
                 raw_item
             )
