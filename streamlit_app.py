@@ -162,6 +162,10 @@ SYSTEM_PROMPT = """
 7. Цены, предполагаемую массу и параметры «по аналогии» не добавляй.
 8. Если фрагмент содержит только продолжение позиции, используй ее
    действительный номер. Не добавляй позиции вне этого фрагмента.
+9. Если в ТЗ написано «50 (Штука)», верни отдельные поля:
+"quantity": 50,
+"unit": "Штука".
+Никогда не возвращай null для unit, если единица указана рядом с количеством.
 """.strip()
 
 
@@ -606,6 +610,7 @@ def clean_string(
     if not isinstance(value, str):
         raise AppError(
             f"Поле «{field}» должно быть строкой."
+            f"value «{value}»"
         )
 
     text = re.sub(
@@ -760,45 +765,68 @@ def validate_string_list(
 
     return tuple(result)
 
-def parse_quantity(value: Any, position: int) -> float:
-    """Принимает JSON-число или строку вида '50', '50,5', '50 (Штука)'."""
-    if isinstance(value, bool) or value is None:
+def parse_quantity_and_unit(
+    quantity_value: Any,
+    unit_value: Any,
+    position: int,
+) -> tuple[float, str]:
+    """Разбирает JSON-число либо строку вида '50 (Штука)'."""
+
+    embedded_unit: str | None = None
+
+    if isinstance(quantity_value, bool) or quantity_value is None:
         raise AppError(
             f"Позиция №{position}: quantity не указан или имеет неверный тип."
         )
 
-    if isinstance(value, (int, float)):
-        number = float(value)
-    elif isinstance(value, str):
-        text = value.strip().replace("\u00a0", " ")
+    if isinstance(quantity_value, (int, float)):
+        quantity = float(quantity_value)
+
+    elif isinstance(quantity_value, str):
+        text = quantity_value.strip().replace("\u00a0", " ")
 
         match = re.fullmatch(
-            r"(\d+(?:[ \u202f]\d{3})*(?:[.,]\d+)?)"
-            r"(?:\s*\([^)]+\))?",
+            r"\s*(\d+(?:[ \u202f]\d{3})*(?:[.,]\d+)?)"
+            r"\s*(?:\(([^)]+)\))?\s*",
             text,
         )
+
         if not match:
             raise AppError(
                 f"Позиция №{position}: не удалось распознать quantity: "
                 f"{text[:80]!r}"
             )
 
-        number = float(
-            match.group(1).replace(" ", "").replace("\u202f", "").replace(",", ".")
+        quantity = float(
+            match.group(1)
+            .replace(" ", "")
+            .replace("\u202f", "")
+            .replace(",", ".")
         )
+        embedded_unit = match.group(2)
+
     else:
         raise AppError(
             f"Позиция №{position}: неверный тип quantity: "
-            f"{type(value).__name__}."
+            f"{type(quantity_value).__name__}."
         )
 
-    if not math.isfinite(number) or not 0 <= number < 1_000_000_000:
+    if not math.isfinite(quantity) or not 0 < quantity < 1_000_000_000:
         raise AppError(
             f"Позиция №{position}: количество должно быть положительным числом."
-            f"value{number}"
         )
 
-    return number
+    if isinstance(unit_value, str) and unit_value.strip():
+        unit = unit_value.strip()
+    elif embedded_unit:
+        unit = embedded_unit.strip()
+    else:
+        raise AppError(
+            f"Позиция №{position}: единица измерения отсутствует. "
+            "В ответе модели ожидается поле unit, например «Штука»."
+        )
+
+    return quantity, unit
 
 def validate_item(
     raw: Any,
@@ -850,8 +878,6 @@ def validate_item(
             "положительным."
         )
 
-    quantity = parse_quantity(raw.get("quantity"), number)
-
     logistics_raw = raw.get(
         "delivery_logistics"
     )
@@ -875,14 +901,10 @@ def validate_item(
         ),
     )
 
-    unit = clean_string(
-        raw.get(
-            "unit"
-        ),
-        (
-            f"позиция №{number}, "
-            "unit"
-        ),
+    quantity, unit = parse_quantity_and_unit(
+        raw.get("quantity"),
+        raw.get("unit"),
+        number,
     )
 
     assert name is not None
@@ -903,9 +925,7 @@ def validate_item(
                 allow_empty=False,
             )
         ),
-        quantity=float(
-            quantity
-        ),
+        quantity=quantity,
         unit=unit,
         delivery_logistics=(
             DeliveryLogistics(
