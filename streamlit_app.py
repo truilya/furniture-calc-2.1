@@ -1,5 +1,5 @@
 """
-PDF-ТЗ → подготовленный Excel-шаблон.
+PDF-ТЗ → подготовленный XLSX через GPTunnel.
 
 Установка:
     pip install streamlit pypdf openpyxl pandas requests
@@ -7,17 +7,16 @@ PDF-ТЗ → подготовленный Excel-шаблон.
 Запуск:
     streamlit run app.py
 
-Безопасность и ограничения:
-- API-ключ вводится пользователем в боковой панели и не записывается в XLSX.
-- Для публичных провайдеров используется HTTPS.
-- Собственный endpoint допускает HTTP для локального Ollama/vLLM.
-- PDF должен содержать извлекаемый текст: OCR сканов здесь не выполняется.
-- Приложение не вставляет и не удаляет строки шаблона, чтобы не сдвигать
-  формулы и связанные диапазоны.
-- Товарные блоки сопоставляются строго по номерам позиций.
-- Если PDF и шаблон относятся к разным закупкам, обработка останавливается.
-- Существующие цены, логистические оценки и текст служебных листов не
-  объявляются данными нового ТЗ и не заменяются догадками модели.
+Адрес API GPTunnel можно изменить в боковой панели. По умолчанию
+используется OpenAI-совместимый endpoint:
+    https://gptunnel.ru/v1/chat/completions
+
+Если в вашей конфигурации GPTunnel используется иной API URL или
+другие идентификаторы моделей, укажите соответствующий URL и выберите
+«Указать модель вручную…».
+
+Важно: приложение не вставляет строки в Excel, не исправляет формулы
+и не подменяет данные несоответствующего шаблона.
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -38,13 +38,12 @@ from openpyxl.cell.cell import MergedCell
 from pypdf import PdfReader
 
 
-# ---------------------------------------------------------------------------
-# Конфигурация
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Модели: список из предыдущей версии сохранён
+# ---------------------------------------------------------------------
 
 PROVIDERS: dict[str, dict[str, Any]] = {
     "OpenAI": {
-        "base_url": "https://api.openai.com/v1",
         "models": [
             "gpt-4o-mini",
             "gpt-4o",
@@ -53,7 +52,6 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         ],
     },
     "OpenRouter": {
-        "base_url": "https://openrouter.ai/api/v1",
         "models": [
             "anthropic/claude-sonnet-5",
             "openai/gpt-5.6-sol",
@@ -66,7 +64,6 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         ],
     },
     "Groq": {
-        "base_url": "https://api.groq.com/openai/v1",
         "models": [
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
@@ -74,13 +71,18 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         ],
     },
     "Свой endpoint": {
-        "base_url": "http://localhost:11434/v1",
         "models": [
             "deepseek-r1:70b",
             "qwen2.5-vl:72b",
         ],
     },
 }
+
+# Подписи групп сохранены для удобства поиска модели.
+# Независимо от выбранной группы запрос всегда отправляется в GPTunnel.
+DEFAULT_GPTUNNEL_CHAT_URL = (
+    "https://gptunnel.ru/v1/chat/completions"
+)
 
 PRICE_SHEET = "Цены изделий (входящие)"
 LOGISTICS_SHEET = "Логистика и пр. расходы"
@@ -89,44 +91,13 @@ ECONOMICS_SHEET = "Экономика"
 MAX_PDF_BYTES = 25 * 1024 * 1024
 MAX_XLSX_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 100
-
-# Размер ограничивает один запрос. Длинные документы обрабатываются частями.
 MAX_CHUNK_CHARS = 10_000
 MAX_OUTPUT_TOKENS = 8_000
-
 REQUEST_TIMEOUT = (10, 180)
 
-ITEM_NUMBER_RE = re.compile(r"^\s*(\d{1,4})\s*[.)](?:\s|$)")
-
-
-class AppError(Exception):
-    """Ошибка, сообщение которой можно показать в интерфейсе."""
-
-
-@dataclass(frozen=True)
-class LLMSettings:
-    provider: str
-    model: str
-    base_url: str
-    api_key: str
-
-
-@dataclass(frozen=True)
-class ProcurementItem:
-    position_number: int
-    object_name: str
-    quantity: float
-    unit: str
-    delivery_address: str | None
-    delivery_deadline: str | None
-    characteristics: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class RowBlock:
-    position_number: int
-    first_row: int
-    last_row: int
+ITEM_NUMBER_RE = re.compile(
+    r"^\s*(\d{1,4})\s*[.)](?:\s|$)"
+)
 
 
 SYSTEM_PROMPT = """
@@ -192,23 +163,89 @@ SYSTEM_PROMPT = """
 """.strip()
 
 
-# ---------------------------------------------------------------------------
-# Чтение файлов
-# ---------------------------------------------------------------------------
+class AppError(Exception):
+    """Ошибка, предназначенная для показа в интерфейсе."""
 
-def read_uploaded_file(uploaded_file: Any, limit: int, label: str) -> bytes:
+
+@dataclass(frozen=True)
+class GPTunnelSettings:
+    chat_url: str
+    api_key: str
+    model: str
+
+
+@dataclass(frozen=True)
+class ProcurementInfo:
+    object_of_purchase: str | None
+    customer: str | None
+    total_quantity: float | None
+
+
+@dataclass(frozen=True)
+class DeliveryLogistics:
+    address: str | None
+    deadline_days_or_date: str | None
+    delivery_form: str | None
+
+
+@dataclass(frozen=True)
+class DimensionsMM:
+    width_min: float | None
+    width_max: float | None
+    depth_min: float | None
+    depth_max: float | None
+    height_min: float | None
+    height_max: float | None
+
+
+@dataclass(frozen=True)
+class ProcurementItem:
+    position_number: int
+    name_from_tz: str
+    specifications: tuple[str, ...]
+    quantity: float
+    unit: str
+    delivery_logistics: DeliveryLogistics
+    dimensions_mm: DimensionsMM
+    co_services: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ExtractionResult:
+    procurement_info: ProcurementInfo
+    items: tuple[ProcurementItem, ...]
+
+
+@dataclass(frozen=True)
+class RowBlock:
+    position_number: int
+    first_row: int
+    last_row: int
+
+
+# ---------------------------------------------------------------------
+# Файлы
+# ---------------------------------------------------------------------
+
+def read_uploaded_file(
+    uploaded_file: Any,
+    max_size: int,
+    label: str,
+) -> bytes:
     try:
         data = uploaded_file.getvalue()
     except Exception as exc:
-        raise AppError(f"Не удалось прочитать {label}: {exc}") from exc
+        raise AppError(
+            f"Не удалось прочитать {label}: {exc}"
+        ) from exc
 
     if not data:
         raise AppError(f"{label} пуст.")
 
-    if len(data) > limit:
+    if len(data) > max_size:
         raise AppError(
-            f"{label} превышает допустимый размер "
-            f"{limit // (1024 * 1024)} МБ."
+            f"{label} превышает размер "
+            f"{max_size // (1024 * 1024)} МБ."
         )
 
     return data
@@ -216,50 +253,70 @@ def read_uploaded_file(uploaded_file: Any, limit: int, label: str) -> bytes:
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     if not pdf_bytes.startswith(b"%PDF"):
-        raise AppError("Файл не имеет корректной сигнатуры PDF.")
+        raise AppError(
+            "Загруженный файл не имеет сигнатуры PDF."
+        )
 
     try:
-        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+        reader = PdfReader(
+            io.BytesIO(pdf_bytes),
+            strict=False,
+        )
 
         if reader.is_encrypted:
-            raise AppError("Зашифрованный PDF не поддерживается.")
+            raise AppError(
+                "Зашифрованный PDF не поддерживается."
+            )
 
         if len(reader.pages) > MAX_PDF_PAGES:
             raise AppError(
-                f"В PDF более {MAX_PDF_PAGES} страниц."
+                f"PDF содержит более {MAX_PDF_PAGES} страниц."
             )
 
         pages: list[str] = []
 
-        for page_number, page in enumerate(reader.pages, start=1):
-            text = page.extract_text(extraction_mode="layout") or ""
+        for page_number, page in enumerate(
+            reader.pages,
+            start=1,
+        ):
+            page_text = (
+                page.extract_text(
+                    extraction_mode="layout"
+                )
+                or ""
+            )
 
-            if text.strip():
+            if page_text.strip():
                 pages.append(
-                    f"\n[СТРАНИЦА {page_number}]\n{text}"
+                    f"\n[СТРАНИЦА {page_number}]\n"
+                    f"{page_text}"
                 )
 
-        result = "\n".join(pages).strip()
+        text = "\n".join(pages).strip()
 
     except AppError:
         raise
     except Exception as exc:
         raise AppError(
-            f"Не удалось извлечь текст из PDF: {exc}"
+            f"Ошибка чтения PDF: {exc}"
         ) from exc
 
-    if len(result) < 100:
+    if len(text) < 100:
         raise AppError(
-            "В PDF почти нет извлекаемого текста. "
-            "Для сканированного документа сначала выполните OCR."
+            "В PDF недостаточно извлекаемого текста. "
+            "Для скана сначала выполните OCR."
         )
 
-    return result
+    return text
 
 
-def open_template(xlsx_bytes: bytes) -> openpyxl.Workbook:
+def open_template(
+    xlsx_bytes: bytes,
+) -> openpyxl.Workbook:
     if not xlsx_bytes.startswith(b"PK"):
-        raise AppError("Загруженный файл не похож на XLSX.")
+        raise AppError(
+            "Файл шаблона не похож на XLSX."
+        )
 
     try:
         return openpyxl.load_workbook(
@@ -270,69 +327,108 @@ def open_template(xlsx_bytes: bytes) -> openpyxl.Workbook:
         )
     except Exception as exc:
         raise AppError(
-            f"Не удалось открыть Excel-шаблон: {exc}"
+            f"Не удалось открыть XLSX-шаблон: {exc}"
         ) from exc
 
 
-# ---------------------------------------------------------------------------
-# Настройки API и вызов модели
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# GPTunnel
+# ---------------------------------------------------------------------
 
-def normalize_base_url(provider: str, raw_url: str) -> str:
+def validate_gptunnel_url(
+    raw_url: str,
+) -> str:
     url = raw_url.strip().rstrip("/")
-
-    if not url:
-        raise AppError("Адрес API endpoint не указан.")
-
     parsed = urlparse(url)
 
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+    ):
         raise AppError(
-            "Endpoint должен быть полным URL, например "
-            "http://localhost:11434/v1."
-        )
-
-    if provider != "Свой endpoint" and parsed.scheme != "https":
-        raise AppError(
-            "Для публичного API требуется HTTPS."
+            "Укажите HTTPS URL метода GPTunnel "
+            "chat/completions."
         )
 
     if parsed.username or parsed.password:
         raise AppError(
-            "Не помещайте учетные данные в URL endpoint."
+            "Не передавайте API-ключ внутри URL."
+        )
+
+    if (
+        parsed.hostname is None
+        or not (
+            parsed.hostname == "gptunnel.ru"
+            or parsed.hostname.endswith(
+                ".gptunnel.ru"
+            )
+        )
+    ):
+        raise AppError(
+            "Запросы должны отправляться только "
+            "на домен GPTunnel."
+        )
+
+    if not parsed.path.endswith(
+        "/chat/completions"
+    ):
+        raise AppError(
+            "URL должен оканчиваться "
+            "на /chat/completions."
         )
 
     return url
 
 
-def call_llm(
-    settings: LLMSettings,
+def parse_json_response(
+    content: str,
+) -> dict[str, Any]:
+    text = content.strip()
+
+    fenced = re.fullmatch(
+        r"```(?:json)?\s*(\{.*\})\s*```",
+        text,
+        flags=(
+            re.DOTALL
+            | re.IGNORECASE
+        ),
+    )
+
+    if fenced:
+        text = fenced.group(1)
+
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AppError(
+            "Модель вернула невалидный JSON: "
+            f"{exc}"
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise AppError(
+            "Ответ модели должен быть "
+            "JSON-объектом."
+        )
+
+    return result
+
+
+def call_gptunnel(
+    settings: GPTunnelSettings,
     user_prompt: str,
 ) -> dict[str, Any]:
-    """
-    Все четыре варианта используют Chat Completions-совместимый endpoint.
-
-    response_format=json_object намеренно не включен: поддержка этого
-    параметра отличается у моделей и прокси. JSON строго запрашивается
-    промптом, затем проверяется на стороне приложения.
-    """
-    url = f"{settings.base_url}/chat/completions"
-
     headers = {
-        "Content-Type": "application/json",
+        "Authorization": (
+            f"Bearer {settings.api_key}"
+        ),
+        "Content-Type": (
+            "application/json"
+        ),
     }
-
-    if settings.api_key:
-        headers["Authorization"] = f"Bearer {settings.api_key}"
-
-    if settings.provider == "OpenRouter":
-        headers["HTTP-Referer"] = "http://localhost:8501"
-        headers["X-Title"] = "Procurement TS to Excel"
 
     payload = {
         "model": settings.model,
-        "temperature": 0,
-        "max_tokens": MAX_OUTPUT_TOKENS,
         "messages": [
             {
                 "role": "system",
@@ -343,37 +439,54 @@ def call_llm(
                 "content": user_prompt,
             },
         ],
+        "temperature": 0,
+        "max_tokens": MAX_OUTPUT_TOKENS,
     }
 
     try:
         response = requests.post(
-            url,
+            settings.chat_url,
             headers=headers,
             json=payload,
             timeout=REQUEST_TIMEOUT,
         )
-        response.raise_for_status()
-        body = response.json()
 
-        content = body["choices"][0]["message"]["content"]
+        response.raise_for_status()
+
+        body = response.json()
+        content = body["choices"][0][
+            "message"
+        ]["content"]
 
         if isinstance(content, list):
-            # Некоторые совместимые API отдают текст отдельными частями.
             content = "".join(
                 part.get("text", "")
                 for part in content
-                if isinstance(part, dict)
+                if isinstance(
+                    part,
+                    dict,
+                )
             )
 
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("В ответе модели отсутствует текст.")
+        if (
+            not isinstance(
+                content,
+                str,
+            )
+            or not content.strip()
+        ):
+            raise AppError(
+                "GPTunnel вернул пустой ответ модели."
+            )
 
-        return parse_json_response(content)
+        return parse_json_response(
+            content
+        )
 
     except requests.Timeout as exc:
         raise AppError(
-            f"Превышено время ожидания API: "
-            f"{settings.provider} / {settings.model}."
+            "Превышено время ожидания "
+            "ответа GPTunnel."
         ) from exc
 
     except requests.HTTPError as exc:
@@ -382,44 +495,29 @@ def call_llm(
             if exc.response is not None
             else "неизвестен"
         )
+
         raise AppError(
-            f"API {settings.provider} вернул HTTP {status} для модели "
-            f"«{settings.model}». Проверьте API-ключ, доступность "
-            "идентификатора модели, лимиты и URL endpoint."
+            f"GPTunnel вернул HTTP {status} "
+            f"для модели «{settings.model}». "
+            "Проверьте ключ, URL, баланс и "
+            "доступность ID модели."
         ) from exc
 
     except requests.RequestException as exc:
         raise AppError(
-            f"Ошибка подключения к {settings.provider}: {exc}"
+            f"Сетевая ошибка GPTunnel: {exc}"
         ) from exc
 
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise AppError(
-            f"Модель «{settings.model}» вернула некорректный ответ: "
-            f"{exc}"
+            "Неожиданный формат ответа "
+            f"GPTunnel: {exc}"
         ) from exc
-
-
-def parse_json_response(content: str) -> dict[str, Any]:
-    text = content.strip()
-
-    # Допускаем только распространенную обертку ```json ... ```.
-    # Произвольный текст вокруг JSON не принимаем.
-    fenced = re.fullmatch(
-        r"```(?:json)?\s*(\{.*\})\s*```",
-        text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-    if fenced:
-        text = fenced.group(1)
-
-    parsed = json.loads(text)
-
-    if not isinstance(parsed, dict):
-        raise ValueError("Корнем ответа должен быть JSON-объект.")
-
-    return parsed
 
 
 def split_text(
@@ -429,7 +527,11 @@ def split_text(
     if len(text) <= max_chars:
         return [text]
 
-    paragraphs = re.split(r"\n\s*\n", text)
+    paragraphs = re.split(
+        r"\n\s*\n",
+        text,
+    )
+
     chunks: list[str] = []
     current = ""
 
@@ -446,9 +548,15 @@ def split_text(
 
             step = max_chars - 500
 
-            for start in range(0, len(paragraph), step):
+            for start in range(
+                0,
+                len(paragraph),
+                step,
+            ):
                 chunks.append(
-                    paragraph[start:start + max_chars]
+                    paragraph[
+                        start:start + max_chars
+                    ]
                 )
 
             continue
@@ -459,14 +567,17 @@ def split_text(
             else paragraph
         )
 
-        if len(candidate) > max_chars and current:
+        if (
+            len(candidate) > max_chars
+            and current
+        ):
             chunks.append(current)
 
-            context = current[-500:]
-
             current = (
-                "[КОНТЕКСТ ПРЕДЫДУЩЕГО ФРАГМЕНТА]\n"
-                f"{context}\n\n{paragraph}"
+                "[КОНТЕКСТ ПРЕДЫДУЩЕГО "
+                "ФРАГМЕНТА]\n"
+                f"{current[-500:]}\n\n"
+                f"{paragraph}"
             )
         else:
             current = candidate
@@ -477,9 +588,14 @@ def split_text(
     return chunks
 
 
-def clean_text(
+# ---------------------------------------------------------------------
+# Проверка JSON
+# ---------------------------------------------------------------------
+
+def clean_string(
     value: Any,
     field: str,
+    *,
     nullable: bool = False,
 ) -> str | None:
     if value is None and nullable:
@@ -487,81 +603,270 @@ def clean_text(
 
     if not isinstance(value, str):
         raise AppError(
-            f"Поле «{field}» имеет неверный тип."
+            f"Поле «{field}» должно быть строкой."
         )
 
-    result = re.sub(r"\s+", " ", value).strip()
+    text = re.sub(
+        r"\s+",
+        " ",
+        value,
+    ).strip()
 
-    if not result and not nullable:
+    if not text and not nullable:
         raise AppError(
-            f"Обязательное поле «{field}» пусто."
+            f"Поле «{field}» пусто."
         )
 
-    return result or None
+    return text or None
 
 
-def validate_llm_item(raw: Any) -> ProcurementItem:
+def optional_nonnegative_number(
+    value: Any,
+    field: str,
+) -> float | None:
+    if value is None:
+        return None
+
+    if (
+        isinstance(
+            value,
+            bool,
+        )
+        or not isinstance(
+            value,
+            (int, float),
+        )
+    ):
+        raise AppError(
+            f"Поле «{field}» должно быть числом "
+            "или null."
+        )
+
+    number = float(value)
+
+    if (
+        not math.isfinite(number)
+        or number < 0
+    ):
+        raise AppError(
+            f"Поле «{field}» содержит "
+            "недопустимое число."
+        )
+
+    return number
+
+
+def validate_dimensions(
+    raw: Any,
+    position: int,
+) -> DimensionsMM:
     if not isinstance(raw, dict):
         raise AppError(
-            "Одна из позиций ответа модели не является JSON-объектом."
+            f"Позиция №{position}: "
+            "dimensions_mm должен быть объектом."
         )
 
-    number = raw.get("position_number")
+    fields = {}
 
-    if (
-        isinstance(number, bool)
-        or not isinstance(number, int)
-        or number < 1
+    for name in (
+        "width_min",
+        "width_max",
+        "depth_min",
+        "depth_max",
+        "height_min",
+        "height_max",
+    ):
+        fields[name] = (
+            optional_nonnegative_number(
+                raw.get(name),
+                (
+                    f"позиция №{position}, "
+                    f"dimensions_mm.{name}"
+                ),
+            )
+        )
+
+    for axis in (
+        "width",
+        "depth",
+        "height",
+    ):
+        minimum = fields[
+            f"{axis}_min"
+        ]
+
+        maximum = fields[
+            f"{axis}_max"
+        ]
+
+        if (
+            minimum is not None
+            and maximum is not None
+            and minimum > maximum
+        ):
+            raise AppError(
+                f"Позиция №{position}: "
+                f"{axis}_min больше "
+                f"{axis}_max."
+            )
+
+    return DimensionsMM(
+        **fields,
+    )
+
+
+def validate_string_list(
+    raw: Any,
+    field: str,
+    *,
+    allow_empty: bool,
+) -> tuple[str, ...]:
+    if not isinstance(
+        raw,
+        list,
     ):
         raise AppError(
-            "Некорректный номер одной из позиций."
+            f"Поле «{field}» должно быть массивом."
         )
-
-    quantity = raw.get("quantity")
 
     if (
-        isinstance(quantity, bool)
-        or not isinstance(quantity, (int, float))
-        or not 0 < float(quantity) < 1_000_000_000
+        not allow_empty
+        and not raw
     ):
         raise AppError(
-            f"Позиция №{number}: некорректное количество."
+            f"Поле «{field}» пусто."
         )
 
-    characteristics = raw.get("characteristics")
-
-    if (
-        not isinstance(characteristics, list)
-        or not characteristics
-    ):
-        raise AppError(
-            f"Позиция №{number}: отсутствуют характеристики."
-        )
-
-    unique_lines: list[str] = []
+    result: list[str] = []
     seen: set[str] = set()
 
-    for raw_line in characteristics:
-        line = clean_text(
-            raw_line,
-            f"характеристика позиции №{number}",
+    for value in raw:
+        line = clean_string(
+            value,
+            field,
         )
 
         assert line is not None
 
-        normalized = line.casefold()
+        normalized = (
+            line.casefold()
+        )
 
         if normalized not in seen:
             seen.add(normalized)
-            unique_lines.append(line)
+            result.append(line)
 
-    name = clean_text(
-        raw.get("object_name"),
-        "object_name",
+    return tuple(result)
+
+
+def validate_item(
+    raw: Any,
+) -> ProcurementItem:
+    if not isinstance(raw, dict):
+        raise AppError(
+            "Одна из позиций не является "
+            "JSON-объектом."
+        )
+
+    raw_number = raw.get(
+        "position_number"
     )
-    unit = clean_text(
-        raw.get("unit"),
-        "unit",
+
+    if isinstance(
+        raw_number,
+        bool,
+    ):
+        raise AppError(
+            "Некорректный номер позиции."
+        )
+
+    if isinstance(
+        raw_number,
+        int,
+    ):
+        number = raw_number
+
+    elif (
+        isinstance(
+            raw_number,
+            str,
+        )
+        and raw_number.strip().isdigit()
+    ):
+        number = int(
+            raw_number.strip()
+        )
+
+    else:
+        raise AppError(
+            "position_number должен содержать "
+            "номер позиции."
+        )
+
+    if number < 1:
+        raise AppError(
+            "Номер позиции должен быть "
+            "положительным."
+        )
+
+    quantity = raw.get(
+        "quantity"
+    )
+
+    if (
+        isinstance(
+            quantity,
+            bool,
+        )
+        or not isinstance(
+            quantity,
+            (int, float),
+        )
+        or not math.isfinite(
+            float(quantity)
+        )
+        or not (
+            0
+            < float(quantity)
+            < 1_000_000_000
+        )
+    ):
+        raise AppError(
+            f"Позиция №{number}: "
+            "некорректное количество."
+        )
+
+    logistics_raw = raw.get(
+        "delivery_logistics"
+    )
+
+    if not isinstance(
+        logistics_raw,
+        dict,
+    ):
+        raise AppError(
+            f"Позиция №{number}: "
+            "нет объекта delivery_logistics."
+        )
+
+    name = clean_string(
+        raw.get(
+            "name_from_tz"
+        ),
+        (
+            f"позиция №{number}, "
+            "name_from_tz"
+        ),
+    )
+
+    unit = clean_string(
+        raw.get(
+            "unit"
+        ),
+        (
+            f"позиция №{number}, "
+            "unit"
+        ),
     )
 
     assert name is not None
@@ -569,167 +874,554 @@ def validate_llm_item(raw: Any) -> ProcurementItem:
 
     return ProcurementItem(
         position_number=number,
-        object_name=name,
-        quantity=float(quantity),
+        name_from_tz=name,
+        specifications=(
+            validate_string_list(
+                raw.get(
+                    "specifications"
+                ),
+                (
+                    f"позиция №{number}, "
+                    "specifications"
+                ),
+                allow_empty=False,
+            )
+        ),
+        quantity=float(
+            quantity
+        ),
         unit=unit,
-        delivery_address=clean_text(
-            raw.get("delivery_address"),
-            "delivery_address",
-            nullable=True,
+        delivery_logistics=(
+            DeliveryLogistics(
+                address=clean_string(
+                    logistics_raw.get(
+                        "address"
+                    ),
+                    (
+                        f"позиция №{number}, "
+                        "address"
+                    ),
+                    nullable=True,
+                ),
+                deadline_days_or_date=(
+                    clean_string(
+                        logistics_raw.get(
+                            "deadline_days_or_date"
+                        ),
+                        (
+                            f"позиция №{number}, "
+                            "deadline_days_or_date"
+                        ),
+                        nullable=True,
+                    )
+                ),
+                delivery_form=clean_string(
+                    logistics_raw.get(
+                        "delivery_form"
+                    ),
+                    (
+                        f"позиция №{number}, "
+                        "delivery_form"
+                    ),
+                    nullable=True,
+                ),
+            )
         ),
-        delivery_deadline=clean_text(
-            raw.get("delivery_deadline"),
-            "delivery_deadline",
-            nullable=True,
+        dimensions_mm=(
+            validate_dimensions(
+                raw.get(
+                    "dimensions_mm"
+                ),
+                number,
+            )
         ),
-        characteristics=tuple(unique_lines),
+        co_services=(
+            validate_string_list(
+                raw.get(
+                    "co_services"
+                ),
+                (
+                    f"позиция №{number}, "
+                    "co_services"
+                ),
+                allow_empty=True,
+            )
+        ),
     )
 
 
-def extract_items_with_llm(
-    text: str,
-    settings: LLMSettings,
-) -> list[ProcurementItem]:
-    chunks = split_text(text)
-    merged: dict[int, ProcurementItem] = {}
+def validate_procurement_info(
+    raw: Any,
+) -> ProcurementInfo:
+    if not isinstance(
+        raw,
+        dict,
+    ):
+        raise AppError(
+            "Ответ модели не содержит "
+            "procurement_info."
+        )
 
-    for index, chunk in enumerate(chunks, start=1):
-        result = call_llm(
+    return ProcurementInfo(
+        object_of_purchase=(
+            clean_string(
+                raw.get(
+                    "object_of_purchase"
+                ),
+                "object_of_purchase",
+                nullable=True,
+            )
+        ),
+        customer=clean_string(
+            raw.get(
+                "customer"
+            ),
+            "customer",
+            nullable=True,
+        ),
+        total_quantity=(
+            optional_nonnegative_number(
+                raw.get(
+                    "total_quantity"
+                ),
+                "total_quantity",
+            )
+        ),
+    )
+
+
+def ordered_union(
+    first: tuple[str, ...],
+    second: tuple[str, ...],
+) -> tuple[str, ...]:
+    result = list(first)
+
+    seen = {
+        value.casefold()
+        for value in result
+    }
+
+    for value in second:
+        normalized = (
+            value.casefold()
+        )
+
+        if normalized not in seen:
+            result.append(value)
+            seen.add(normalized)
+
+    return tuple(result)
+
+
+def merge_items(
+    old: ProcurementItem,
+    new: ProcurementItem,
+) -> ProcurementItem:
+    if (
+        old.name_from_tz.casefold()
+        != new.name_from_tz.casefold()
+        or old.quantity
+        != new.quantity
+        or old.unit.casefold()
+        != new.unit.casefold()
+    ):
+        raise AppError(
+            "Противоречивые ответы модели "
+            f"для позиции №{old.position_number}."
+        )
+
+    old_logistics = (
+        old.delivery_logistics
+    )
+
+    new_logistics = (
+        new.delivery_logistics
+    )
+
+    # Для пересечения фрагментов не выбираем молча
+    # два различных конкретных значения.
+    for field in (
+        "address",
+        "deadline_days_or_date",
+        "delivery_form",
+    ):
+        left = getattr(
+            old_logistics,
+            field,
+        )
+
+        right = getattr(
+            new_logistics,
+            field,
+        )
+
+        if (
+            left
+            and right
+            and left.casefold()
+            != right.casefold()
+        ):
+            raise AppError(
+                f"Позиция №{old.position_number}: "
+                f"противоречие в поле {field}."
+            )
+
+    old_dims = (
+        old.dimensions_mm
+    )
+
+    new_dims = (
+        new.dimensions_mm
+    )
+
+    dimension_values: dict[
+        str,
+        float | None
+    ] = {}
+
+    for field in (
+        "width_min",
+        "width_max",
+        "depth_min",
+        "depth_max",
+        "height_min",
+        "height_max",
+    ):
+        left = getattr(
+            old_dims,
+            field,
+        )
+
+        right = getattr(
+            new_dims,
+            field,
+        )
+
+        if (
+            left is not None
+            and right is not None
+            and left != right
+        ):
+            raise AppError(
+                f"Позиция №{old.position_number}: "
+                f"противоречие в {field}."
+            )
+
+        dimension_values[field] = (
+            left
+            if left is not None
+            else right
+        )
+
+    return ProcurementItem(
+        position_number=(
+            old.position_number
+        ),
+        name_from_tz=(
+            old.name_from_tz
+        ),
+        specifications=(
+            ordered_union(
+                old.specifications,
+                new.specifications,
+            )
+        ),
+        quantity=old.quantity,
+        unit=old.unit,
+        delivery_logistics=(
+            DeliveryLogistics(
+                address=(
+                    old_logistics.address
+                    or new_logistics.address
+                ),
+                deadline_days_or_date=(
+                    old_logistics.deadline_days_or_date
+                    or new_logistics.deadline_days_or_date
+                ),
+                delivery_form=(
+                    old_logistics.delivery_form
+                    or new_logistics.delivery_form
+                ),
+            )
+        ),
+        dimensions_mm=(
+            DimensionsMM(
+                **dimension_values
+            )
+        ),
+        co_services=(
+            ordered_union(
+                old.co_services,
+                new.co_services,
+            )
+        ),
+    )
+
+
+def extract_data_with_llm(
+    pdf_text: str,
+    settings: GPTunnelSettings,
+) -> ExtractionResult:
+    chunks = split_text(
+        pdf_text
+    )
+
+    merged_items: dict[
+        int,
+        ProcurementItem
+    ] = {}
+
+    procurement_infos: list[
+        ProcurementInfo
+    ] = []
+
+    for index, chunk in enumerate(
+        chunks,
+        start=1,
+    ):
+        raw_result = call_gptunnel(
             settings,
             (
-                f"Фрагмент документа {index}/{len(chunks)}.\n"
-                "Извлеки позиции только из этого фрагмента.\n\n"
+                "Извлеки данные только из "
+                f"фрагмента {index}/{len(chunks)}.\n"
+                "Если общий объект закупки или "
+                "заказчик отсутствует во фрагменте, "
+                "используй null. "
+                "Если товарных позиций нет, "
+                "верни items: [].\n\n"
                 f"{chunk}"
             ),
         )
 
-        raw_items = result.get("items")
+        info = (
+            validate_procurement_info(
+                raw_result.get(
+                    "procurement_info"
+                )
+            )
+        )
 
-        if not isinstance(raw_items, list):
+        procurement_infos.append(
+            info
+        )
+
+        raw_items = (
+            raw_result.get(
+                "items"
+            )
+        )
+
+        if not isinstance(
+            raw_items,
+            list,
+        ):
             raise AppError(
-                f"Фрагмент {index}: ответ модели "
-                "не содержит массив items."
+                f"Фрагмент {index}: поле items "
+                "должно быть массивом."
             )
 
         for raw_item in raw_items:
-            item = validate_llm_item(raw_item)
-            previous = merged.get(item.position_number)
-
-            if previous is None:
-                merged[item.position_number] = item
-                continue
-
-            if (
-                previous.object_name.casefold()
-                != item.object_name.casefold()
-                or previous.quantity != item.quantity
-                or previous.unit.casefold()
-                != item.unit.casefold()
-            ):
-                raise AppError(
-                    "Модель вернула противоречивые данные "
-                    f"для позиции №{item.position_number}."
-                )
-
-            combined = list(previous.characteristics)
-            existing = {
-                line.casefold()
-                for line in combined
-            }
-
-            for line in item.characteristics:
-                if line.casefold() not in existing:
-                    combined.append(line)
-                    existing.add(line.casefold())
-
-            merged[item.position_number] = ProcurementItem(
-                position_number=item.position_number,
-                object_name=previous.object_name,
-                quantity=previous.quantity,
-                unit=previous.unit,
-                delivery_address=(
-                    previous.delivery_address
-                    or item.delivery_address
-                ),
-                delivery_deadline=(
-                    previous.delivery_deadline
-                    or item.delivery_deadline
-                ),
-                characteristics=tuple(combined),
+            item = validate_item(
+                raw_item
             )
 
-    if not merged:
+            existing = (
+                merged_items.get(
+                    item.position_number
+                )
+            )
+
+            if existing is None:
+                merged_items[
+                    item.position_number
+                ] = item
+            else:
+                merged_items[
+                    item.position_number
+                ] = merge_items(
+                    existing,
+                    item,
+                )
+
+    if not merged_items:
         raise AppError(
-            "Модель не обнаружила товарных позиций в PDF."
+            "Модель не обнаружила "
+            "товарных позиций."
         )
 
-    return [
-        merged[number]
-        for number in sorted(merged)
-    ]
+    items = tuple(
+        merged_items[number]
+        for number in sorted(
+            merged_items
+        )
+    )
 
+    def first_nonempty(
+        field: str,
+    ) -> str | None:
+        for info in procurement_infos:
+            value = getattr(
+                info,
+                field,
+            )
 
-# ---------------------------------------------------------------------------
-# Работа с Excel
-# ---------------------------------------------------------------------------
+            if value:
+                return value
 
-def item_number(value: Any) -> int | None:
-    if not isinstance(value, str):
         return None
 
-    match = ITEM_NUMBER_RE.match(value)
+    # Сумма проверенных количеств надежнее, чем
+    # total_quantity отдельного фрагмента.
+    total_quantity = sum(
+        item.quantity
+        for item in items
+    )
 
-    if not match:
+    return ExtractionResult(
+        procurement_info=(
+            ProcurementInfo(
+                object_of_purchase=(
+                    first_nonempty(
+                        "object_of_purchase"
+                    )
+                ),
+                customer=(
+                    first_nonempty(
+                        "customer"
+                    )
+                ),
+                total_quantity=(
+                    total_quantity
+                ),
+            )
+        ),
+        items=items,
+    )
+
+
+# ---------------------------------------------------------------------
+# Excel
+# ---------------------------------------------------------------------
+
+def item_number(
+    value: Any,
+) -> int | None:
+    if not isinstance(
+        value,
+        str,
+    ):
         return None
 
-    return int(match.group(1))
+    match = ITEM_NUMBER_RE.match(
+        value
+    )
+
+    return (
+        int(match.group(1))
+        if match
+        else None
+    )
 
 
 def find_header_row(
-    ws: openpyxl.worksheet.worksheet.Worksheet,
+    ws: Any,
 ) -> int:
     for row in ws.iter_rows(
         min_row=1,
-        max_row=min(ws.max_row, 30),
-        max_col=min(ws.max_column, 7),
+        max_row=min(
+            ws.max_row,
+            30,
+        ),
+        max_col=min(
+            ws.max_column,
+            7,
+        ),
     ):
         values = [
-            str(cell.value or "")
-            .replace("\n", " ")
+            str(
+                cell.value
+                or ""
+            )
+            .replace(
+                "\n",
+                " ",
+            )
             .casefold()
             for cell in row
         ]
 
         if any(
-            "наименование товара из тз" in value
+            (
+                "наименование товара "
+                "из тз"
+            )
+            in value
             for value in values
         ):
             return row[0].row
 
     raise AppError(
-        f"Лист «{ws.title}»: не найден заголовок "
+        f"Лист «{ws.title}»: "
+        "не найден заголовок "
         "«Наименование товара из ТЗ»."
     )
 
 
 def detect_blocks(
-    ws: openpyxl.worksheet.worksheet.Worksheet,
+    ws: Any,
     header_row: int,
 ) -> list[RowBlock]:
-    starts: list[tuple[int, int]] = []
-    stop_row = ws.max_row + 1
+    starts: list[
+        tuple[int, int]
+    ] = []
 
-    for row in range(header_row + 1, ws.max_row + 1):
-        value = ws.cell(row, 1).value
-        number = item_number(value)
+    stop_row = (
+        ws.max_row + 1
+    )
+
+    for row in range(
+        header_row + 1,
+        ws.max_row + 1,
+    ):
+        first_value = (
+            ws.cell(
+                row,
+                1,
+            ).value
+        )
+
+        number = item_number(
+            first_value
+        )
 
         if number is not None:
-            starts.append((row, number))
+            starts.append(
+                (
+                    row,
+                    number,
+                )
+            )
             continue
 
-        if starts and isinstance(value, str):
-            if value.strip().casefold().startswith(
-                ("итого", "итоговая", "всего")
+        if (
+            starts
+            and isinstance(
+                first_value,
+                str,
+            )
+        ):
+            lowered = (
+                first_value
+                .strip()
+                .casefold()
+            )
+
+            if lowered.startswith(
+                (
+                    "итого",
+                    "итоговая",
+                    "всего",
+                )
             ):
                 stop_row = row
                 break
@@ -737,108 +1429,146 @@ def detect_blocks(
     if not starts:
         raise AppError(
             f"Лист «{ws.title}»: "
-            "не найдены пронумерованные товарные блоки."
+            "нет нумерованных блоков."
         )
 
     numbers = [
         number
-        for _, number in starts
+        for _,
+        number in starts
     ]
 
-    if len(numbers) != len(set(numbers)):
+    if len(
+        numbers
+    ) != len(
+        set(numbers)
+    ):
         raise AppError(
             f"Лист «{ws.title}»: "
-            "номера товарных блоков повторяются."
+            "номера блоков повторяются."
         )
 
-    blocks: list[RowBlock] = []
+    result: list[
+        RowBlock
+    ] = []
 
-    for index, (first_row, number) in enumerate(starts):
+    for index, (
+        row,
+        number,
+    ) in enumerate(starts):
         last_row = (
-            starts[index + 1][0] - 1
-            if index + 1 < len(starts)
+            starts[
+                index + 1
+            ][0] - 1
+            if index + 1
+            < len(starts)
             else stop_row - 1
         )
 
-        blocks.append(
+        result.append(
             RowBlock(
-                position_number=number,
-                first_row=first_row,
-                last_row=last_row,
+                position_number=(
+                    number
+                ),
+                first_row=row,
+                last_row=(
+                    last_row
+                ),
             )
         )
 
-    return blocks
+    return result
 
 
 def assert_editable(
-    ws: openpyxl.worksheet.worksheet.Worksheet,
+    ws: Any,
     row: int,
     column: int,
 ) -> None:
-    cell = ws.cell(row, column)
+    cell = ws.cell(
+        row,
+        column,
+    )
 
-    if isinstance(cell, MergedCell):
+    if isinstance(
+        cell,
+        MergedCell,
+    ):
         raise AppError(
-            f"Нельзя записать в объединенную ячейку "
-            f"«{ws.title}!{cell.coordinate}»."
+            f"Ячейка "
+            f"{ws.title}!"
+            f"{cell.coordinate} "
+            "входит в объединенный "
+            "диапазон."
         )
 
     if (
-        cell.data_type == "f"
+        cell.data_type
+        == "f"
         or (
-            isinstance(cell.value, str)
-            and cell.value.startswith("=")
+            isinstance(
+                cell.value,
+                str,
+            )
+            and cell.value
+            .startswith("=")
         )
     ):
         raise AppError(
-            f"Ячейка «{ws.title}!{cell.coordinate}» "
+            f"Ячейка "
+            f"{ws.title}!"
+            f"{cell.coordinate} "
             "содержит формулу."
         )
 
 
 def set_cell(
-    ws: openpyxl.worksheet.worksheet.Worksheet,
+    ws: Any,
     row: int,
     column: int,
-    value: str | int | float | None,
+    value: (
+        str
+        | int
+        | float
+        | None
+    ),
 ) -> None:
-    assert_editable(ws, row, column)
-    ws.cell(row, column).value = value
+    assert_editable(
+        ws,
+        row,
+        column,
+    )
+
+    ws.cell(
+        row,
+        column,
+    ).value = value
 
 
-def check_capacity(
-    ws: openpyxl.worksheet.worksheet.Worksheet,
+def write_lines(
+    ws: Any,
     block: RowBlock,
-    needed: int,
+    column: int,
+    values: list[str],
 ) -> None:
-    capacity = (
+    available = (
         block.last_row
         - block.first_row
         + 1
     )
 
-    if needed > capacity:
+    if len(
+        values
+    ) > available:
         raise AppError(
-            f"Лист «{ws.title}», позиция "
-            f"№{block.position_number}: "
-            f"требуется {needed} строк, доступно {capacity}. "
-            "Подготовьте более вместительный шаблон. "
-            "Вставка строк отключена для защиты формул."
+            f"Лист «{ws.title}», "
+            f"позиция №"
+            f"{block.position_number}: "
+            f"нужно {len(values)} "
+            f"строк, доступно "
+            f"{available}. "
+            "Расширьте шаблон вручную."
         )
-
-
-def write_characteristics(
-    ws: openpyxl.worksheet.worksheet.Worksheet,
-    block: RowBlock,
-    column: int,
-    values: list[str],
-) -> None:
-    check_capacity(
-        ws,
-        block,
-        len(values),
-    )
 
     for row in range(
         block.first_row,
@@ -850,17 +1580,22 @@ def write_characteristics(
             column,
         )
 
-    for index, value in enumerate(values):
+    for index, value in enumerate(
+        values
+    ):
         set_cell(
             ws,
-            block.first_row + index,
+            block.first_row
+            + index,
             column,
             value,
         )
 
     for row in range(
-        block.first_row + len(values),
-        block.last_row + 1,
+        block.first_row
+        + len(values),
+        block.last_row
+        + 1,
     ):
         set_cell(
             ws,
@@ -870,8 +1605,11 @@ def write_characteristics(
         )
 
 
-def dimension_characteristics(
-    characteristics: tuple[str, ...],
+def dimension_lines(
+    specifications: tuple[
+        str,
+        ...
+    ],
 ) -> list[str]:
     prefixes = (
         "высота",
@@ -884,184 +1622,249 @@ def dimension_characteristics(
 
     return [
         line
-        for line in characteristics
-        if line.casefold().startswith(prefixes)
+        for line in specifications
+        if line.casefold()
+        .startswith(prefixes)
     ]
 
 
-def validate_template_mapping(
+def validate_mapping(
     workbook: openpyxl.Workbook,
-    items: list[ProcurementItem],
-) -> dict[str, dict[int, RowBlock]]:
-    required_sheets = {
+    items: tuple[
+        ProcurementItem,
+        ...
+    ],
+) -> dict[
+    str,
+    dict[
+        int,
+        RowBlock,
+    ],
+]:
+    required = {
         PRICE_SHEET,
         LOGISTICS_SHEET,
         ECONOMICS_SHEET,
     }
 
-    missing_sheets = (
-        required_sheets
-        - set(workbook.sheetnames)
+    missing = required - set(
+        workbook.sheetnames
     )
 
-    if missing_sheets:
+    if missing:
         raise AppError(
-            "В шаблоне отсутствуют листы: "
-            + ", ".join(sorted(missing_sheets))
+            "В шаблоне нет листов: "
+            + ", ".join(
+                sorted(missing)
+            )
         )
 
-    result: dict[str, dict[int, RowBlock]] = {}
+    mappings: dict[
+        str,
+        dict[
+            int,
+            RowBlock,
+        ],
+    ] = {}
 
     for sheet_name in (
         PRICE_SHEET,
         LOGISTICS_SHEET,
         ECONOMICS_SHEET,
     ):
-        ws = workbook[sheet_name]
-        header_row = find_header_row(ws)
-        blocks = detect_blocks(ws, header_row)
+        ws = workbook[
+            sheet_name
+        ]
 
-        result[sheet_name] = {
+        blocks = detect_blocks(
+            ws,
+            find_header_row(
+                ws
+            ),
+        )
+
+        mappings[
+            sheet_name
+        ] = {
             block.position_number: block
             for block in blocks
         }
 
-    pdf_numbers = {
+    expected = {
         item.position_number
         for item in items
     }
 
-    for sheet_name, mapping in result.items():
-        template_numbers = set(mapping)
+    for sheet_name, mapping in (
+        mappings.items()
+    ):
+        actual = set(
+            mapping
+        )
 
-        if template_numbers != pdf_numbers:
-            missing = sorted(
-                pdf_numbers - template_numbers
-            )
-            surplus = sorted(
-                template_numbers - pdf_numbers
-            )
-
+        if actual != expected:
             raise AppError(
-                f"Лист «{sheet_name}» не соответствует PDF. "
-                f"Отсутствующие блоки: {missing}; "
-                f"лишние блоки: {surplus}. "
-                "Автоматическая подмена позиций "
-                "другой закупки запрещена."
+                f"Лист «{sheet_name}» "
+                "не соответствует "
+                "позициям PDF. "
+                "Нет блоков: "
+                f"{sorted(expected - actual)}; "
+                "лишние блоки: "
+                f"{sorted(actual - expected)}. "
+                "Подмена данных "
+                "другой закупки "
+                "не выполняется."
             )
 
-    return result
+    return mappings
 
 
 def populate_workbook(
     workbook: openpyxl.Workbook,
-    items: list[ProcurementItem],
+    extraction: ExtractionResult,
 ) -> None:
-    mapping = validate_template_mapping(
+    mapping = validate_mapping(
         workbook,
-        items,
+        extraction.items,
     )
 
-    prices = workbook[PRICE_SHEET]
-    logistics = workbook[LOGISTICS_SHEET]
-    economics = workbook[ECONOMICS_SHEET]
+    price_ws = workbook[
+        PRICE_SHEET
+    ]
 
-    for item in items:
-        price_block = mapping[PRICE_SHEET][
-            item.position_number
-        ]
+    logistics_ws = workbook[
+        LOGISTICS_SHEET
+    ]
 
-        logistics_block = mapping[
-            LOGISTICS_SHEET
-        ][item.position_number]
+    economics_ws = workbook[
+        ECONOMICS_SHEET
+    ]
 
-        economics_block = mapping[
-            ECONOMICS_SHEET
-        ][item.position_number]
-
-        name_cell_value = (
-            f"{item.position_number}.\n"
-            f"{item.object_name}"
+    for item in (
+        extraction.items
+    ):
+        price_block = (
+            mapping[
+                PRICE_SHEET
+            ][
+                item.position_number
+            ]
         )
 
-        quantity: int | float = (
-            int(item.quantity)
-            if item.quantity.is_integer()
+        logistics_block = (
+            mapping[
+                LOGISTICS_SHEET
+            ][
+                item.position_number
+            ]
+        )
+
+        economics_block = (
+            mapping[
+                ECONOMICS_SHEET
+            ][
+                item.position_number
+            ]
+        )
+
+        label = (
+            f"{item.position_number}.\n"
+            f"{item.name_from_tz}"
+        )
+
+        quantity: (
+            int
+            | float
+        ) = (
+            int(
+                item.quantity
+            )
+            if item.quantity
+            .is_integer()
             else item.quantity
         )
 
         # Цены изделий:
-        # A — номер/название, D — характеристики, E — количество.
-        # Цены, изображения, данные поставщика и суммы не трогаем.
+        # A — позиция, D — характеристики,
+        # E — количество.
         set_cell(
-            prices,
+            price_ws,
             price_block.first_row,
             1,
-            name_cell_value,
+            label,
         )
+
         set_cell(
-            prices,
+            price_ws,
             price_block.first_row,
             5,
             quantity,
         )
-        write_characteristics(
-            prices,
+
+        write_lines(
+            price_ws,
             price_block,
             4,
-            list(item.characteristics),
+            list(
+                item.specifications
+            ),
         )
 
         # Логистика:
-        # A — номер/название, C — размерные характеристики,
+        # A — позиция, C — строки габаритов,
         # D — количество, E — единица.
         set_cell(
-            logistics,
+            logistics_ws,
             logistics_block.first_row,
             1,
-            name_cell_value,
+            label,
         )
+
         set_cell(
-            logistics,
+            logistics_ws,
             logistics_block.first_row,
             4,
             quantity,
         )
+
         set_cell(
-            logistics,
+            logistics_ws,
             logistics_block.first_row,
             5,
             item.unit,
         )
-        write_characteristics(
-            logistics,
+
+        write_lines(
+            logistics_ws,
             logistics_block,
             3,
-            dimension_characteristics(
-                item.characteristics
+            dimension_lines(
+                item.specifications
             ),
         )
 
-        # Экономика: только идентификатор и количество.
-        # Цены, источники товара и расчетные поля сохраняем.
+        # Экономика:
+        # A — позиция, C — количество.
+        # Цены и формулы не меняем.
         set_cell(
-            economics,
+            economics_ws,
             economics_block.first_row,
             1,
-            name_cell_value,
+            label,
         )
+
         set_cell(
-            economics,
+            economics_ws,
             economics_block.first_row,
             3,
             quantity,
         )
 
-    # Просим Excel пересчитать сохраненные формулы при открытии.
-    # Сам openpyxl значения формул не вычисляет.
     try:
         workbook.calculation = (
-            openpyxl.workbook.properties.CalcProperties(
+            openpyxl.workbook
+            .properties
+            .CalcProperties(
                 calcMode="auto",
                 fullCalcOnLoad=True,
                 forceFullCalc=True,
@@ -1071,206 +1874,282 @@ def populate_workbook(
         pass
 
 
-def save_workbook(
+def workbook_to_bytes(
     workbook: openpyxl.Workbook,
 ) -> bytes:
     try:
         output = io.BytesIO()
-        workbook.save(output)
-        result = output.getvalue()
+
+        workbook.save(
+            output
+        )
+
+        result = (
+            output.getvalue()
+        )
 
         if not result:
             raise ValueError(
-                "Получен пустой XLSX."
+                "Пустой XLSX."
             )
 
         return result
 
     except Exception as exc:
         raise AppError(
-            f"Не удалось сохранить XLSX: {exc}"
+            "Ошибка сохранения XLSX: "
+            f"{exc}"
         ) from exc
 
 
 def items_dataframe(
-    items: list[ProcurementItem],
+    extraction: ExtractionResult,
 ) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "№": item.position_number,
-                "Объект": item.object_name,
-                "Количество": item.quantity,
-                "Ед. изм.": item.unit,
-                "Адрес поставки": (
-                    item.delivery_address
+                "№": (
+                    item.position_number
+                ),
+                "Наименование": (
+                    item.name_from_tz
+                ),
+                "Количество": (
+                    item.quantity
+                ),
+                "Ед. изм.": (
+                    item.unit
+                ),
+                "Адрес": (
+                    item.delivery_logistics
+                    .address
                     or "Не указан"
                 ),
-                "Срок поставки": (
-                    item.delivery_deadline
+                "Срок": (
+                    item.delivery_logistics
+                    .deadline_days_or_date
                     or "Не указан"
                 ),
                 "Характеристик": len(
-                    item.characteristics
+                    item.specifications
+                ),
+                "Сопутствующих услуг": len(
+                    item.co_services
                 ),
             }
-            for item in items
+            for item in (
+                extraction.items
+            )
         ]
     )
 
 
-# ---------------------------------------------------------------------------
-# Интерфейс
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Streamlit
+# ---------------------------------------------------------------------
 
-def provider_settings_ui() -> LLMSettings:
-    st.sidebar.header("Модель анализа")
-
-    provider = st.sidebar.selectbox(
-        "Провайдер",
-        list(PROVIDERS),
+def settings_ui() -> GPTunnelSettings:
+    st.sidebar.header(
+        "GPTunnel"
     )
 
-    config = PROVIDERS[provider]
-
-    model_choice = st.sidebar.selectbox(
-        "Модель",
-        [
-            *config["models"],
-            "Указать модель вручную…",
-        ],
-        key=f"model_choice_{provider}",
+    st.sidebar.caption(
+        "Группы ниже используются только "
+        "для выбора модели. Все запросы "
+        "отправляются через GPTunnel."
     )
 
-    if model_choice == "Указать модель вручную…":
-        model = st.sidebar.text_input(
-            "Идентификатор модели в API",
-            key=f"custom_model_{provider}",
-        ).strip()
+    model_group = (
+        st.sidebar.selectbox(
+            "Группа моделей",
+            list(PROVIDERS),
+        )
+    )
+
+    model_choice = (
+        st.sidebar.selectbox(
+            "Модель",
+            [
+                *PROVIDERS[
+                    model_group
+                ]["models"],
+                (
+                    "Указать модель "
+                    "вручную…"
+                ),
+            ],
+            key=(
+                "model_choice_"
+                f"{model_group}"
+            ),
+        )
+    )
+
+    if model_choice == (
+        "Указать модель вручную…"
+    ):
+        model = (
+            st.sidebar
+            .text_input(
+                "ID модели в GPTunnel",
+                key=(
+                    "manual_model_"
+                    f"{model_group}"
+                ),
+            )
+            .strip()
+        )
     else:
         model = model_choice
 
-    if provider == "Свой endpoint":
-        raw_base_url = st.sidebar.text_input(
-            "Base URL Chat Completions API",
-            value=config["base_url"],
+    chat_url = (
+        st.sidebar.text_input(
+            "URL GPTunnel API",
+            value=(
+                DEFAULT_GPTUNNEL_CHAT_URL
+            ),
             help=(
-                "Например, http://localhost:11434/v1. "
-                "Приложение вызовет /chat/completions."
+                "Полный HTTPS URL метода "
+                "/chat/completions."
             ),
         )
-    else:
-        raw_base_url = config["base_url"]
+    )
 
-        st.sidebar.caption(
-            f"API endpoint: `{raw_base_url}`"
+    api_key = (
+        st.sidebar.text_input(
+            "API-ключ GPTunnel",
+            type="password",
+            help=(
+                "Ключ используется для "
+                "запросов и не записывается "
+                "в Excel."
+            ),
         )
-
-    api_key = st.sidebar.text_input(
-        "API-ключ",
-        type="password",
-        key=f"api_key_{provider}",
-        help=(
-            "Ключ используется только для текущих запросов. "
-            "Для локального endpoint без авторизации "
-            "поле можно оставить пустым."
-        ),
+        .strip()
     )
 
     if not model:
         raise AppError(
-            "Укажите идентификатор модели."
+            "Выберите или укажите "
+            "модель."
         )
 
-    if (
-        provider != "Свой endpoint"
-        and not api_key.strip()
-    ):
+    if not api_key:
         raise AppError(
-            f"Для провайдера {provider} "
-            "необходимо указать API-ключ."
+            "Укажите API-ключ "
+            "GPTunnel."
         )
 
-    return LLMSettings(
-        provider=provider,
-        model=model,
-        base_url=normalize_base_url(
-            provider,
-            raw_base_url,
+    return GPTunnelSettings(
+        chat_url=(
+            validate_gptunnel_url(
+                chat_url
+            )
         ),
-        api_key=api_key.strip(),
+        api_key=api_key,
+        model=model,
     )
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="ТЗ → Excel",
+        page_title=(
+            "ТЗ → Excel"
+        ),
         page_icon="📋",
         layout="wide",
     )
 
     st.title(
-        "Техническое задание → Excel-шаблон"
+        "Техническое задание "
+        "→ Excel"
     )
 
     st.write(
-        "Выберите провайдера и модель, укажите API-ключ, "
-        "загрузите PDF и подготовленный XLSX-шаблон."
+        "Загрузите PDF с текстовым слоем "
+        "и подготовленный XLSX-шаблон. "
+        "Анализ выполняется через GPTunnel."
     )
 
     try:
-        settings = provider_settings_ui()
+        settings = (
+            settings_ui()
+        )
     except AppError as exc:
-        st.sidebar.error(str(exc))
+        st.sidebar.error(
+            str(exc)
+        )
         return
 
-    st.subheader("Исходные файлы")
-
-    pdf_upload = st.file_uploader(
-        "Техническое задание, PDF",
-        type=["pdf"],
-        key="pdf_upload",
+    st.subheader(
+        "Исходные файлы"
     )
 
-    xlsx_upload = st.file_uploader(
-        "Подготовленный Excel-шаблон, XLSX",
-        type=["xlsx"],
-        key="xlsx_upload",
+    pdf_upload = (
+        st.file_uploader(
+            "PDF с техническим заданием",
+            type=["pdf"],
+            key="pdf_upload",
+        )
     )
 
-    if not pdf_upload or not xlsx_upload:
+    xlsx_upload = (
+        st.file_uploader(
+            "XLSX-шаблон",
+            type=["xlsx"],
+            key="xlsx_upload",
+        )
+    )
+
+    if (
+        pdf_upload is None
+        or xlsx_upload is None
+    ):
         return
 
     try:
-        pdf_bytes = read_uploaded_file(
-            pdf_upload,
-            MAX_PDF_BYTES,
-            "PDF-файл",
+        pdf_bytes = (
+            read_uploaded_file(
+                pdf_upload,
+                MAX_PDF_BYTES,
+                "PDF-файл",
+            )
         )
-        xlsx_bytes = read_uploaded_file(
-            xlsx_upload,
-            MAX_XLSX_BYTES,
-            "Excel-шаблон",
+
+        xlsx_bytes = (
+            read_uploaded_file(
+                xlsx_upload,
+                MAX_XLSX_BYTES,
+                "Excel-шаблон",
+            )
         )
+
     except AppError as exc:
-        st.error(str(exc))
+        st.error(
+            str(exc)
+        )
         return
 
-    # Отпечаток зависит и от ключа: после его замены старый результат
-    # не будет ошибочно показан как результат нового запуска.
-    # Сам ключ не сохраняется в отпечатке в открытом виде.
-    fingerprint = hashlib.sha256(
-        b"\0".join(
-            [
-                pdf_bytes,
-                xlsx_bytes,
-                settings.provider.encode(),
-                settings.model.encode(),
-                settings.base_url.encode(),
-                settings.api_key.encode(),
-            ]
+    # Ключ участвует только в вычислении хеша
+    # текущего запуска; его открытое значение
+    # не сохраняется в результате или XLSX.
+    fingerprint = (
+        hashlib.sha256(
+            b"\0".join(
+                [
+                    pdf_bytes,
+                    xlsx_bytes,
+                    settings.chat_url
+                    .encode(),
+                    settings.model
+                    .encode(),
+                    settings.api_key
+                    .encode(),
+                ]
+            )
         )
-    ).hexdigest()
+        .hexdigest()
+    )
 
     if (
         st.session_state.get(
@@ -1278,55 +2157,63 @@ def main() -> None:
         )
         != fingerprint
     ):
-        st.session_state.pop(
+        for key in (
             "result_binary",
-            None,
-        )
-        st.session_state.pop(
             "result_dataframe",
-            None,
-        )
-        st.session_state.pop(
+            "result_info",
             "result_fingerprint",
-            None,
-        )
+        ):
+            st.session_state.pop(
+                key,
+                None,
+            )
 
-    already_generated = bool(
+    has_result = bool(
         st.session_state.get(
             "result_binary"
         )
     )
 
     if st.button(
-        "Проанализировать и заполнить шаблон",
+        "Проанализировать ТЗ "
+        "и заполнить шаблон",
         type="primary",
-        disabled=already_generated,
+        disabled=has_result,
     ):
         with st.spinner(
-            "Извлекаем текст, вызываем модель "
-            "и проверяем шаблон…"
+            "Читаем PDF, отправляем "
+            "фрагменты в GPTunnel "
+            "и проверяем XLSX…"
         ):
             try:
-                pdf_text = extract_pdf_text(
-                    pdf_bytes
+                pdf_text = (
+                    extract_pdf_text(
+                        pdf_bytes
+                    )
                 )
 
-                items = extract_items_with_llm(
-                    pdf_text,
-                    settings,
+                extraction = (
+                    extract_data_with_llm(
+                        pdf_text,
+                        settings,
+                    )
                 )
 
-                workbook = open_template(
-                    xlsx_bytes
+                workbook = (
+                    open_template(
+                        xlsx_bytes
+                    )
                 )
 
                 populate_workbook(
                     workbook,
-                    items,
+                    extraction,
                 )
 
-                result_binary = save_workbook(
-                    workbook
+                result_binary = (
+                    workbook_to_bytes(
+                        workbook
+                    )
                 )
 
                 st.session_state[
@@ -1335,26 +2222,62 @@ def main() -> None:
 
                 st.session_state[
                     "result_dataframe"
-                ] = items_dataframe(items)
+                ] = items_dataframe(
+                    extraction
+                )
+
+                st.session_state[
+                    "result_info"
+                ] = (
+                    extraction
+                    .procurement_info
+                )
 
                 st.session_state[
                     "result_fingerprint"
                 ] = fingerprint
 
             except AppError as exc:
-                st.error(str(exc))
+                st.error(
+                    str(exc)
+                )
 
             except Exception as exc:
                 st.error(
                     "Непредвиденная ошибка: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
                 )
 
     if st.session_state.get(
         "result_binary"
     ):
         st.success(
-            "Заполненный файл подготовлен."
+            "Файл подготовлен."
+        )
+
+        info: ProcurementInfo = (
+            st.session_state[
+                "result_info"
+            ]
+        )
+
+        st.subheader(
+            "Сведения о закупке"
+        )
+
+        st.write(
+            {
+                "Объект закупки": (
+                    info.object_of_purchase
+                ),
+                "Заказчик": (
+                    info.customer
+                ),
+                "Общее количество": (
+                    info.total_quantity
+                ),
+            }
         )
 
         st.subheader(
@@ -1370,24 +2293,31 @@ def main() -> None:
         )
 
         st.warning(
-            "Проверьте результат перед использованием. "
-            "Старые цены, масса, объемы, расчеты "
-            "и тексты служебных листов шаблона "
+            "Проверьте цены, логистические "
+            "оценки и служебные листы: они "
+            "не извлекаются из нового PDF и "
             "могут относиться к другой закупке. "
             "Формулы пересчитываются Excel "
             "при открытии файла."
         )
 
         st.download_button(
-            label="Скачать заполненный XLSX",
-            data=st.session_state[
-                "result_binary"
-            ],
+            label=(
+                "Скачать заполненный XLSX"
+            ),
+            data=(
+                st.session_state[
+                    "result_binary"
+                ]
+            ),
             file_name=(
-                "ТЗ_заполненный_шаблон.xlsx"
+                "ТЗ_заполненный_"
+                "шаблон.xlsx"
             ),
             mime=(
-                "application/vnd.openxmlformats-officedocument."
+                "application/vnd."
+                "openxmlformats-"
+                "officedocument."
                 "spreadsheetml.sheet"
             ),
         )
