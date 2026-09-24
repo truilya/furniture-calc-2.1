@@ -1237,6 +1237,8 @@ def extract_data_with_llm(
             ),
         )
 
+
+
         info = (
             validate_procurement_info(
                 raw_result.get(
@@ -1255,6 +1257,20 @@ def extract_data_with_llm(
             )
         )
 
+        st.write(
+            f"Фрагмент {index}/{len(chunks)}",
+            {
+                "ключи ответа": list(raw_result.keys()),
+                "тип items": type(raw_items).__name__,
+                "число позиций": len(raw_items) if isinstance(raw_items, list) else None,
+                "номера позиций": [
+                    item.get("position_number")
+                    for item in raw_items
+                    if isinstance(item, dict)
+                ] if isinstance(raw_items, list) else None,
+            },
+        )
+
         if not isinstance(
             raw_items,
             list,
@@ -1266,7 +1282,7 @@ def extract_data_with_llm(
 
         for raw_item in raw_items:
 
-           
+
             item = validate_item(
                 raw_item
             )
