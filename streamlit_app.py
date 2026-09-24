@@ -1206,157 +1206,45 @@ def extract_data_with_llm(
     pdf_text: str,
     settings: GPTunnelSettings,
 ) -> ExtractionResult:
-    chunks = split_text(
-        pdf_text
+    raw_result = call_gptunnel(
+        settings,
+        "Ниже приведён полный извлечённый текст ТЗ. "
+        "Найди все позиции приложения «Перечень объектов закупки». "
+        "Восстанови связи между строками таблицы, если PDF разорвал их "
+        "при извлечении. Не создавай позиции, которых нет в тексте.\n\n"
+        + pdf_text,
     )
 
-    merged_items: dict[
-        int,
-        ProcurementItem
-    ] = {}
+    raw_items = raw_result.get("items")
 
-    procurement_infos: list[
-        ProcurementInfo
-    ] = []
-
-    for index, chunk in enumerate(
-        chunks,
-        start=1,
-    ):
-        raw_result = call_gptunnel(
-            settings,
-            (
-                "Извлеки данные только из "
-                f"фрагмента {index}/{len(chunks)}.\n"
-                "Если общий объект закупки или "
-                "заказчик отсутствует во фрагменте, "
-                "используй null. "
-                "Если товарных позиций нет, "
-                "верни items: [].\n\n"
-                f"{chunk}"
-            ),
-        )
-
-
-
-        info = (
-            validate_procurement_info(
-                raw_result.get(
-                    "procurement_info"
-                )
-            )
-        )
-
-        procurement_infos.append(
-            info
-        )
-
-        raw_items = (
-            raw_result.get(
-                "items"
-            )
-        )
-
-        st.write(
-            f"Фрагмент {index}/{len(chunks)}",
-            {
-                "ключи ответа": list(raw_result.keys()),
-                "тип items": type(raw_items).__name__,
-                "число позиций": len(raw_items) if isinstance(raw_items, list) else None,
-                "номера позиций": [
-                    item.get("position_number")
-                    for item in raw_items
-                    if isinstance(item, dict)
-                ] if isinstance(raw_items, list) else None,
-            },
-        )
-
-        if not isinstance(
-            raw_items,
-            list,
-        ):
-            raise AppError(
-                f"Фрагмент {index}: поле items "
-                "должно быть массивом."
-            )
-
-        for raw_item in raw_items:
-
-
-            item = validate_item(
-                raw_item
-            )
-
-            existing = (
-                merged_items.get(
-                    item.position_number
-                )
-            )
-
-            if existing is None:
-                merged_items[
-                    item.position_number
-                ] = item
-            else:
-                merged_items[
-                    item.position_number
-                ] = merge_items(
-                    existing,
-                    item,
-                )
-
-    if not merged_items:
+    if not isinstance(raw_items, list):
+        raise AppError("Ответ модели: items должен быть массивом.")
+    if not raw_items:
         raise AppError(
-            "Модель не обнаружила "
-            "товарных позиций."
+            "Модель вернула items: []. Проверьте, видны ли в извлечённом "
+            "тексте строки с позициями и количеством."
         )
 
-    items = tuple(
-        merged_items[number]
-        for number in sorted(
-            merged_items
+    items = tuple(validate_item(raw) for raw in raw_items)
+    numbers = [item.position_number for item in items]
+    if len(numbers) != len(set(numbers)):
+        raise AppError("Модель вернула повторяющиеся номера позиций.")
+
+    info = validate_procurement_info(raw_result.get("procurement_info"))
+
+    # Проверяем, что заявленное общее количество не расходится с позициями.
+    calculated_total = sum(item.quantity for item in items)
+    if (
+        info.total_quantity is not None
+        and info.total_quantity != calculated_total
+    ):
+        raise AppError(
+            f"Общее количество в ответе модели ({info.total_quantity:g}) "
+            f"не совпадает с суммой позиций ({calculated_total:g})."
         )
-    )
-
-    def first_nonempty(
-        field: str,
-    ) -> str | None:
-        for info in procurement_infos:
-            value = getattr(
-                info,
-                field,
-            )
-
-            if value:
-                return value
-
-        return None
-
-    # Сумма проверенных количеств надежнее, чем
-    # total_quantity отдельного фрагмента.
-    total_quantity = sum(
-        item.quantity
-        for item in items
-    )
 
     return ExtractionResult(
-        procurement_info=(
-            ProcurementInfo(
-                object_of_purchase=(
-                    first_nonempty(
-                        "object_of_purchase"
-                    )
-                ),
-                customer=(
-                    first_nonempty(
-                        "customer"
-                    )
-                ),
-                total_quantity=(
-                    total_quantity
-                ),
-            )
-        ),
+        procurement_info=info,
         items=items,
     )
 
